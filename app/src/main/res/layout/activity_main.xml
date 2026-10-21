@@ -31,6 +31,15 @@
             <TextView android:id="@+id/evLbl" android:layout_width="52dp" android:layout_height="wrap_content" android:textColor="#FFFFFF" android:text="EV 0"/>
             <SeekBar android:id="@+id/ev" android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content"/>
         </LinearLayout>
+        <LinearLayout android:id="@+id/lastBar" android:layout_width="wrap_content" android:layout_height="40dp" android:layout_gravity="center_horizontal"
+            android:orientation="horizontal" android:gravity="center_vertical" android:background="@drawable/glass_pill" android:paddingStart="12dp" android:paddingEnd="4dp"
+            android:layout_marginBottom="8dp" android:visibility="gone">
+            <TextView android:id="@+id/lastName" android:layout_width="wrap_content" android:maxWidth="150dp" android:layout_height="wrap_content" android:textColor="#FFF" android:textSize="12sp" android:singleLine="true" android:ellipsize="middle"/>
+            <TextView android:id="@+id/btnUpload" android:layout_width="wrap_content" android:layout_height="32dp" android:gravity="center" android:background="@drawable/done_btn"
+                android:paddingStart="14dp" android:paddingEnd="14dp" android:layout_marginStart="8dp" android:text="☁ 上傳" android:textColor="#111" android:textStyle="bold"/>
+            <TextView android:id="@+id/btnMulti" android:layout_width="wrap_content" android:layout_height="32dp" android:gravity="center" android:paddingStart="10dp" android:paddingEnd="6dp" android:text="多選" android:textColor="#FFB020" android:textStyle="bold"/>
+            <TextView android:id="@+id/btnClose" android:layout_width="32dp" android:layout_height="32dp" android:gravity="center" android:text="✕" android:textColor="#B3FFFFFF"/>
+        </LinearLayout>
         <LinearLayout android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_gravity="center_horizontal"
             android:background="@drawable/glass_pill" android:padding="3dp" android:layout_marginTop="6dp" android:layout_marginBottom="14dp">
             <TextView android:id="@+id/mPhoto" android:layout_width="wrap_content" android:layout_height="30dp" android:gravity="center" android:paddingStart="18dp" android:paddingEnd="18dp" android:text="照片" android:textStyle="bold" android:letterSpacing="0.1"/>
