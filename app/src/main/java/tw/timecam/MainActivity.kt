@@ -93,9 +93,11 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(s)
         WindowCompat.setDecorFitsSystemWindows(window, false)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        WindowCompat.getInsetsController(window, window.decorView).apply { isAppearanceLightStatusBars = true; isAppearanceLightNavigationBars = true }
         setContentView(R.layout.activity_main)
         previewView = findViewById(R.id.preview); wm = findViewById(R.id.wm); shutter = findViewById(R.id.shutter)
-        previewView.scaleType = PreviewView.ScaleType.FILL_CENTER
+        previewView.scaleType = PreviewView.ScaleType.FIT_CENTER
+        previewView.setBackgroundColor(Color.WHITE)
         previewView.implementationMode = PreviewView.ImplementationMode.PERFORMANCE
         val top = findViewById<View>(R.id.top); val ctrl = findViewById<View>(R.id.ctrl)
         ViewCompat.setOnApplyWindowInsetsListener(findViewById(R.id.root)) { _, ins ->
@@ -103,8 +105,8 @@ class MainActivity : AppCompatActivity() {
             top.setPadding(top.paddingLeft, b.top + dp(12), top.paddingRight, top.paddingBottom)
             ctrl.setPadding(ctrl.paddingLeft, ctrl.paddingTop, ctrl.paddingRight, b.bottom + dp(18)); ins
         }
-        ctrl.addOnLayoutChangeListener { _, _, t, _, _, _, _, _, _ -> wm.bottomInset = (findViewById<View>(R.id.root).height - t).toFloat(); wm.invalidate() }
-        top.addOnLayoutChangeListener { _, _, _, _, b, _, _, _, _ -> wm.topInset = b.toFloat(); wm.invalidate() }
+        ctrl.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> ctrl.post { updateFrame() } }
+        top.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> top.post { updateFrame() } }
         refreshSite()
         findViewById<View>(R.id.mPhoto).setOnClickListener { setMode(false) }
         findViewById<View>(R.id.mVideo).setOnClickListener { setMode(true) }
@@ -164,8 +166,7 @@ class MainActivity : AppCompatActivity() {
         val prevSize = if (videoMode) Size(1920, 1080) else Size(1920, 1440)
         val prs = ResolutionSelector.Builder().setAspectRatioStrategy(ratio)
             .setResolutionStrategy(ResolutionStrategy(prevSize, ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER)).build()
-        val rs = ResolutionSelector.Builder().setAspectRatioStrategy(ratio).setResolutionStrategy(ResolutionStrategy.HIGHEST_AVAILABLE_STRATEGY)
-            .setAllowedResolutionMode(ResolutionSelector.PREFER_HIGHER_RESOLUTION_OVER_CAPTURE_RATE).build()
+        val rs = ResolutionSelector.Builder().setAspectRatioStrategy(ratio).setResolutionStrategy(ResolutionStrategy.HIGHEST_AVAILABLE_STRATEGY).build()
         val preview = Preview.Builder().setResolutionSelector(prs).build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
         try {
             if (!videoMode) {
@@ -173,21 +174,38 @@ class MainActivity : AppCompatActivity() {
                     .setResolutionSelector(rs).setJpegQuality(100).setTargetRotation(rotation).build()
                 imageCapture = ic; videoCapture = null
                 val sel = if (extMode != ExtensionMode.NONE && extMgr != null) extMgr!!.getExtensionEnabledCameraSelector(baseSelector(), extMode) else baseSelector()
-                camera = p.bindToLifecycle(this, sel, preview, ic)
+                val g = UseCaseGroup.Builder().setViewPort(viewPort()).addUseCase(preview).addUseCase(ic).build()
+                camera = p.bindToLifecycle(this, sel, g)
             } else {
                 fun tryBind(qs: List<Quality>, bitrate: Int) {
                     val rec = Recorder.Builder().setQualitySelector(QualitySelector.fromOrderedList(qs, FallbackStrategy.lowerQualityOrHigherThan(Quality.SD)))
                         .setTargetVideoEncodingBitRate(bitrate).build()
                     val vc = VideoCapture.withOutput(rec).also { it.targetRotation = rotation }
                     videoCapture = vc; imageCapture = null
-                    val g = UseCaseGroup.Builder().addUseCase(preview).addUseCase(vc).addEffect(overlay).build()
+                    val g = UseCaseGroup.Builder().setViewPort(viewPort()).addUseCase(preview).addUseCase(vc).addEffect(overlay).build()
                     camera = p.bindToLifecycle(this, baseSelector(), g)
                 }
                 try { tryBind(listOf(Quality.UHD, Quality.FHD, Quality.HD), 40_000_000) }
                 catch (e: Exception) { p.unbindAll(); tryBind(listOf(Quality.FHD, Quality.HD), 20_000_000) }
             }
         } catch (e: Exception) { toast("相機啟動失敗：${e.message}"); return }
-        observeCamera(); updateChips()
+        observeCamera(); updateChips(); updateFrame()
+    }
+
+    /** 畫面寬高比（直式）：照片 3:4、錄影 9:16 */
+    private fun aspect() = if (videoMode) 9f / 16f else 3f / 4f
+    private fun viewPort() = ViewPort.Builder(if (videoMode) android.util.Rational(9, 16) else android.util.Rational(3, 4), Surface.ROTATION_0)
+        .setScaleType(ViewPort.FIT).build()
+
+    /** 預覽區域：上方工具列與下方控制列之間；浮水印放在實際影像框內 */
+    private fun updateFrame() {
+        val root = findViewById<View>(R.id.root); val top = findViewById<View>(R.id.top); val ctrl = findViewById<View>(R.id.ctrl)
+        if (root.height == 0) return
+        val lp = previewView.layoutParams as FrameLayout.LayoutParams
+        val tm = top.bottom; val bm = root.height - ctrl.top
+        if (lp.topMargin != tm || lp.bottomMargin != bm) { lp.topMargin = tm; lp.bottomMargin = bm; previewView.layoutParams = lp }
+        val r = ImageMath.fit(root.width.toFloat(), (root.height - tm - bm).toFloat(), aspect())
+        wm.imageRect = RectF(r[0], tm + r[1], r[0] + r[2], tm + r[1] + r[3]); wm.invalidate()
     }
 
     private fun observeCamera() {
@@ -306,56 +324,80 @@ class MainActivity : AppCompatActivity() {
     private fun capture(ic: ImageCapture) {
         val fx = findViewById<View>(R.id.flashFx); fx.alpha = 0.8f; fx.animate().alpha(0f).setDuration(350)
         val t = Names.now(); val d = wm.data; val loc = Geo.loc
-        ic.takePicture(bg, object : ImageCapture.OnImageCapturedCallback() {
-            override fun onCaptureSuccess(image: ImageProxy) {
-                try {
-                    val bytes: ByteArray
-                    if (image.format == ImageFormat.JPEG) {
-                        val buf = image.planes[0].buffer; bytes = ByteArray(buf.remaining()); buf.get(bytes); image.close()
-                    } else {
-                        val bmp = image.toBitmap(); val rot = image.imageInfo.rotationDegrees; image.close()
-                        val out = rotateInto(bmp, rot); bmp.recycle()
-                        Watermark.stamp(Canvas(out), out.width.toFloat(), out.height.toFloat(), d, t)
-                        val name = Names.base(t, d.case_) + ".jpg"; val tmp = File(cacheDir, "o.jpg")
-                        tmp.outputStream().use { out.compress(Bitmap.CompressFormat.JPEG, 98, it) }; out.recycle()
-                        writeGps(tmp, loc); publishJpeg(tmp, name); toast("已儲存 $name"); return
-                    }
-                    val name = Names.base(t, d.case_) + ".jpg"
-                    processJpeg(bytes, d, t, name, loc); toast("已儲存 $name")
-                } catch (e: Throwable) { toast("儲存失敗：${e.message}") }
+        val src = File(cacheDir, "cap_${System.nanoTime()}.jpg")
+        ic.takePicture(ImageCapture.OutputFileOptions.Builder(src).build(), bg, object : ImageCapture.OnImageSavedCallback {
+            override fun onImageSaved(r: ImageCapture.OutputFileResults) {
+                val name = Names.base(t, d.case_) + ".jpg"
+                try { processFile(src, d, t, name, loc); toast("已儲存 $name") }
+                catch (e: Throwable) { toast("儲存失敗：${e.message}") } finally { src.delete() }
             }
-            override fun onError(e: ImageCaptureException) { toast("拍照失敗：${e.message}") }
+            override fun onError(e: ImageCaptureException) { src.delete(); toast("拍照失敗：${e.message}") }
         })
     }
 
-    /** 原尺寸解碼 → 依 EXIF 轉正 → 加浮水印 → 品質 98 重新編碼 → 複製原 EXIF */
-    private fun processJpeg(bytes: ByteArray, d: WmData, t: java.time.ZonedDateTime, name: String, loc: Location? = null) {
-        val src = File(cacheDir, "src.jpg"); src.writeBytes(bytes)
-        val rot = ExifInterface(src).rotationDegrees
-        val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, BitmapFactory.Options().apply { inSampleSize = 1; inPreferredConfig = Bitmap.Config.ARGB_8888; inMutable = rot == 0 })
-            ?: error("無法解碼")
-        val out = if (rot == 0 && bmp.isMutable) bmp else rotateInto(bmp, rot).also { bmp.recycle() }
+    private fun tail(f: File, n: Int = 64): ByteArray = java.io.RandomAccessFile(f, "r").use { raf ->
+        val len = raf.length(); val k = minOf(n.toLong(), len).toInt(); val b = ByteArray(k); raf.seek(len - k); raf.readFully(b); b }
+
+    /** 完整解碼（必要時才降解析度）→ 依 EXIF 轉正 → 加浮水印 → 存檔並驗證 */
+    private fun processFile(src: File, d: WmData, t: java.time.ZonedDateTime, name: String, loc: Location? = null) {
+        // 等待檔案完整（理論上 onImageSaved 時已完成，保險起見）
+        var tries = 0
+        while (!ImageMath.jpegComplete(tail(src)) && tries < 5) { Thread.sleep(150); tries++ }
+        val o = ImageMath.orient(ExifInterface(src).getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL))
+        val bo = BitmapFactory.Options().apply { inJustDecodeBounds = true }; BitmapFactory.decodeFile(src.path, bo)
+        if (bo.outWidth <= 0 || bo.outHeight <= 0) error("無法讀取影像")
+        val maxPx = minOf(50_000_000L, Runtime.getRuntime().maxMemory() / 4 / 3)  // 兩張 ARGB 點陣圖需留餘裕
+        var sample = ImageMath.sampleFor(bo.outWidth, bo.outHeight, maxPx)
+        var out: Bitmap? = null
+        while (out == null) {
+            var bmp: Bitmap? = null
+            try {
+                bmp = BitmapFactory.decodeFile(src.path, BitmapFactory.Options().apply { inSampleSize = sample; inPreferredConfig = Bitmap.Config.ARGB_8888 })
+                    ?: error("無法解碼")
+                if (!ImageMath.decodedOk(bo.outWidth, bo.outHeight, sample, bmp.width, bmp.height)) error("解碼尺寸不符（${bmp.width}x${bmp.height}）")
+                out = orientInto(bmp, o)
+            } catch (e: OutOfMemoryError) {
+                if (sample >= 8) throw e; sample *= 2
+            } finally { if (bmp != null && bmp !== out) bmp.recycle() }
+        }
+        val (ew, eh) = ImageMath.rotatedSize(bo.outWidth / sample, bo.outHeight / sample, o.degrees)
+        if (kotlin.math.abs(out.width - ew) > 1 || kotlin.math.abs(out.height - eh) > 1) error("轉正後尺寸不符")
         Watermark.stamp(Canvas(out), out.width.toFloat(), out.height.toFloat(), d, t)
-        val tmp = File(cacheDir, "out.jpg")
-        tmp.outputStream().use { out.compress(Bitmap.CompressFormat.JPEG, 98, it) }
+        val tmp = File(cacheDir, "out_${System.nanoTime()}.jpg")
+        java.io.FileOutputStream(tmp).use { fo -> out.compress(Bitmap.CompressFormat.JPEG, 98, fo); fo.flush(); fo.fd.sync() }
         val w = out.width; val h = out.height; out.recycle()
-        copyExif(src, tmp, w, h); src.delete(); writeGps(tmp, loc)
+        if (!ImageMath.jpegComplete(tail(tmp))) error("輸出檔不完整")
+        copyExif(src, tmp, w, h); writeGps(tmp, loc)
         publishJpeg(tmp, name)
     }
 
-    private val EXIF_SKIP = setOf(ExifInterface.TAG_ORIENTATION, ExifInterface.TAG_IMAGE_WIDTH, ExifInterface.TAG_IMAGE_LENGTH,
-        ExifInterface.TAG_PIXEL_X_DIMENSION, ExifInterface.TAG_PIXEL_Y_DIMENSION, ExifInterface.TAG_THUMBNAIL_IMAGE_LENGTH, ExifInterface.TAG_THUMBNAIL_IMAGE_WIDTH,
-        ExifInterface.TAG_JPEG_INTERCHANGE_FORMAT, ExifInterface.TAG_JPEG_INTERCHANGE_FORMAT_LENGTH)
-    private val EXIF_TAGS: List<String> by lazy {
-        ExifInterface::class.java.fields.filter { it.name.startsWith("TAG_") && it.type == String::class.java }.mapNotNull { it.get(null) as? String }.filter { it !in EXIF_SKIP }.distinct()
+    private fun orientInto(src: Bitmap, o: ImageMath.Orient): Bitmap {
+        val (w, h) = ImageMath.rotatedSize(src.width, src.height, o.degrees)
+        if (o.degrees == 0 && !o.flipH && src.isMutable) return src
+        val m = Matrix()
+        if (o.flipH) m.postScale(-1f, 1f, src.width / 2f, src.height / 2f)
+        m.postRotate(o.degrees.toFloat())
+        val r = RectF(0f, 0f, src.width.toFloat(), src.height.toFloat()); m.mapRect(r); m.postTranslate(-r.left, -r.top)
+        val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        Canvas(out).drawBitmap(src, m, Paint(Paint.FILTER_BITMAP_FLAG)); return out
     }
+
+    private val EXIF_TAGS = listOf(ExifInterface.TAG_DATETIME, ExifInterface.TAG_DATETIME_ORIGINAL, ExifInterface.TAG_DATETIME_DIGITIZED,
+        ExifInterface.TAG_OFFSET_TIME, ExifInterface.TAG_OFFSET_TIME_ORIGINAL, ExifInterface.TAG_OFFSET_TIME_DIGITIZED,
+        ExifInterface.TAG_SUBSEC_TIME, ExifInterface.TAG_SUBSEC_TIME_ORIGINAL, ExifInterface.TAG_SUBSEC_TIME_DIGITIZED,
+        ExifInterface.TAG_MAKE, ExifInterface.TAG_MODEL, ExifInterface.TAG_F_NUMBER, ExifInterface.TAG_APERTURE_VALUE, ExifInterface.TAG_EXPOSURE_TIME,
+        ExifInterface.TAG_PHOTOGRAPHIC_SENSITIVITY, ExifInterface.TAG_FOCAL_LENGTH, ExifInterface.TAG_FOCAL_LENGTH_IN_35MM_FILM, ExifInterface.TAG_FLASH,
+        ExifInterface.TAG_WHITE_BALANCE, ExifInterface.TAG_EXPOSURE_BIAS_VALUE, ExifInterface.TAG_EXPOSURE_PROGRAM, ExifInterface.TAG_METERING_MODE,
+        ExifInterface.TAG_LENS_MAKE, ExifInterface.TAG_LENS_MODEL, ExifInterface.TAG_DIGITAL_ZOOM_RATIO,
+        ExifInterface.TAG_GPS_LATITUDE, ExifInterface.TAG_GPS_LATITUDE_REF, ExifInterface.TAG_GPS_LONGITUDE, ExifInterface.TAG_GPS_LONGITUDE_REF,
+        ExifInterface.TAG_GPS_ALTITUDE, ExifInterface.TAG_GPS_ALTITUDE_REF, ExifInterface.TAG_GPS_TIMESTAMP, ExifInterface.TAG_GPS_DATESTAMP)
     private fun copyExif(from: File, to: File, w: Int, h: Int) {
         runCatching {
             val a = ExifInterface(from); val b = ExifInterface(to)
             for (tag in EXIF_TAGS) a.getAttribute(tag)?.let { b.setAttribute(tag, it) }
             b.setAttribute(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL.toString())
             b.setAttribute(ExifInterface.TAG_PIXEL_X_DIMENSION, w.toString()); b.setAttribute(ExifInterface.TAG_PIXEL_Y_DIMENSION, h.toString())
-            b.setAttribute(ExifInterface.TAG_SOFTWARE, "時間相機 1.1.1")
+            b.setAttribute(ExifInterface.TAG_SOFTWARE, "時間相機 1.1.2")
             b.saveAttributes()
         }
     }
@@ -365,20 +407,14 @@ class MainActivity : AppCompatActivity() {
         runCatching { ExifInterface(f).apply { setGpsInfo(loc); saveAttributes() } }
     }
 
-    private fun rotateInto(src: Bitmap, rot: Int): Bitmap {
-        val sw = src.width; val sh = src.height
-        val (w, h) = if (rot % 180 == 0) sw to sh else sh to sw
-        val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        val m = Matrix().apply { postRotate(rot.toFloat()); val r = RectF(0f, 0f, sw.toFloat(), sh.toFloat()); mapRect(r); postTranslate(-r.left, -r.top) }
-        Canvas(out).drawBitmap(src, m, Paint(Paint.FILTER_BITMAP_FLAG)); return out
-    }
 
     private fun stampPicked(uri: Uri) = bg.execute {
+        val src = File(cacheDir, "pick_${System.nanoTime()}.jpg")
         try {
             val t = Names.now(); val d = wm.data
-            val bytes = contentResolver.openInputStream(uri)!!.use { it.readBytes() }
-            val name = Names.base(t, d.case_) + ".jpg"; processJpeg(bytes, d, t, name); toast("已儲存 $name")
-        } catch (e: OutOfMemoryError) { toast("相片過大，無法處理") } catch (e: Throwable) { toast("處理失敗：${e.message}") }
+            contentResolver.openInputStream(uri)!!.use { i -> src.outputStream().use { i.copyTo(it) } }
+            val name = Names.base(t, d.case_) + ".jpg"; processFile(src, d, t, name, null); toast("已儲存 $name")
+        } catch (e: OutOfMemoryError) { toast("相片過大，無法處理") } catch (e: Throwable) { toast("處理失敗：${e.message}") } finally { src.delete() }
     }
 
     private val legacyDir get() = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM), "時間相機").apply { mkdirs() }
@@ -391,7 +427,11 @@ class MainActivity : AppCompatActivity() {
                 put(MediaStore.Images.Media.RELATIVE_PATH, "DCIM/時間相機"); put(MediaStore.Images.Media.IS_PENDING, 1)
             }
             val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, v) ?: error("無法建立檔案")
-            contentResolver.openOutputStream(uri)!!.use { o: OutputStream -> tmp.inputStream().use { it.copyTo(o) } }
+            try {
+                contentResolver.openOutputStream(uri, "wt")!!.use { o: OutputStream -> tmp.inputStream().use { it.copyTo(o) }; o.flush() }
+                val written = contentResolver.openFileDescriptor(uri, "r")!!.use { it.statSize }
+                if (written in 0 until tmp.length()) error("寫入不完整（$written/${tmp.length()}）")
+            } catch (e: Throwable) { contentResolver.delete(uri, null, null); throw e }
             v.clear(); v.put(MediaStore.Images.Media.IS_PENDING, 0); contentResolver.update(uri, v, null, null); out = uri
         } else {
             val f = File(legacyDir, name); tmp.copyTo(f, overwrite = true)

@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android" android:id="@+id/root"
-    android:layout_width="match_parent" android:layout_height="match_parent" android:background="#000">
+    android:layout_width="match_parent" android:layout_height="match_parent" android:background="#FFFFFF">
     <androidx.camera.view.PreviewView android:id="@+id/preview" android:layout_width="match_parent" android:layout_height="match_parent"/>
     <tw.timecam.WatermarkView android:id="@+id/wm" android:layout_width="match_parent" android:layout_height="match_parent"/>
     <View android:id="@+id/focus" android:layout_width="72dp" android:layout_height="72dp" android:background="@drawable/focus_ring" android:alpha="0"/>
@@ -24,12 +24,12 @@
     <LinearLayout android:id="@+id/ctrl" android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_gravity="bottom"
         android:orientation="vertical" android:paddingTop="10dp" android:paddingBottom="18dp" android:background="@drawable/ctrl_grad">
         <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:gravity="center_vertical" android:paddingStart="20dp" android:paddingEnd="20dp">
-            <TextView android:id="@+id/zoomLbl" android:layout_width="52dp" android:layout_height="wrap_content" android:textColor="#FFB020" android:textStyle="bold" android:text="1.0x"/>
-            <SeekBar android:id="@+id/zoom" android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content" android:max="100"/>
+            <TextView android:id="@+id/zoomLbl" android:layout_width="52dp" android:layout_height="wrap_content" android:textColor="#C77800" android:textStyle="bold" android:text="1.0x"/>
+            <SeekBar android:progressTint="#FFB020" android:thumbTint="#FFB020" android:progressBackgroundTint="#555555" android:id="@+id/zoom" android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content" android:max="100"/>
         </LinearLayout>
         <LinearLayout android:id="@+id/evRow" android:layout_width="match_parent" android:layout_height="wrap_content" android:gravity="center_vertical" android:paddingStart="20dp" android:paddingEnd="20dp">
-            <TextView android:id="@+id/evLbl" android:layout_width="52dp" android:layout_height="wrap_content" android:textColor="#FFFFFF" android:text="EV 0"/>
-            <SeekBar android:id="@+id/ev" android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content"/>
+            <TextView android:id="@+id/evLbl" android:layout_width="52dp" android:layout_height="wrap_content" android:textColor="#1A1A1A" android:textStyle="bold" android:text="EV 0"/>
+            <SeekBar android:progressTint="#FFB020" android:thumbTint="#FFB020" android:progressBackgroundTint="#555555" android:id="@+id/ev" android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content"/>
         </LinearLayout>
         <LinearLayout android:id="@+id/lastBar" android:layout_width="wrap_content" android:layout_height="40dp" android:layout_gravity="center_horizontal"
             android:orientation="horizontal" android:gravity="center_vertical" android:background="@drawable/glass_pill" android:paddingStart="12dp" android:paddingEnd="4dp"
