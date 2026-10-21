@@ -6,6 +6,8 @@ import android.content.ContentValues
 import android.content.pm.PackageManager
 import android.graphics.*
 import android.media.MediaScannerConnection
+import android.location.*
+import java.util.Locale
 import android.net.Uri
 import android.os.*
 import android.provider.MediaStore
@@ -56,6 +58,11 @@ class MainActivity : AppCompatActivity() {
     private var extMode = ExtensionMode.NONE
     private var rotation = Surface.ROTATION_0
     private var lastTap = 0L
+    @Volatile private var recData: WmData? = null
+    private var lm: LocationManager? = null
+    private var lastGeoLoc: Location? = null
+    private var lastGeoAt = 0L
+    private val locListener = LocationListener { onLoc(it) }
     private val effectThread = HandlerThread("overlay").apply { start() }
     private val overlay by lazy {
         OverlayEffect(CameraEffect.VIDEO_CAPTURE, 0, Handler(effectThread.looper)) { toast("浮水印錯誤：${it.message}") }.apply {
@@ -69,7 +76,7 @@ class MainActivity : AppCompatActivity() {
                 val m = Matrix(); m.postRotate(-deg.toFloat())
                 val r = RectF(0f, 0f, uw, uh); m.mapRect(r); m.postTranslate(-r.left, -r.top)
                 c.setMatrix(m)
-                Watermark.stamp(c, uw, uh, wm.data, Names.now())
+                Watermark.stamp(c, uw, uh, recData ?: wm.data, Names.now())
                 true
             }
         }
@@ -77,6 +84,7 @@ class MainActivity : AppCompatActivity() {
 
     private val perms = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
         if (has(Manifest.permission.CAMERA)) startCamera() else toast("需要相機權限")
+        startLocation()
     }
     private val picker = registerForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri -> if (uri != null) stampPicked(uri) }
 
@@ -94,7 +102,8 @@ class MainActivity : AppCompatActivity() {
             top.setPadding(top.paddingLeft, b.top + dp(12), top.paddingRight, top.paddingBottom)
             ctrl.setPadding(ctrl.paddingLeft, ctrl.paddingTop, ctrl.paddingRight, b.bottom + dp(18)); ins
         }
-        ctrl.addOnLayoutChangeListener { v, _, t, _, _, _, _, _, _ -> wm.bottomInset = (findViewById<View>(R.id.root).height - t).toFloat(); wm.invalidate() }
+        ctrl.addOnLayoutChangeListener { _, _, t, _, _, _, _, _, _ -> wm.bottomInset = (findViewById<View>(R.id.root).height - t).toFloat(); wm.invalidate() }
+        top.addOnLayoutChangeListener { _, _, _, _, b, _, _, _, _ -> wm.topInset = b.toFloat(); wm.invalidate() }
         refreshSite()
         findViewById<View>(R.id.mPhoto).setOnClickListener { setMode(false) }
         findViewById<View>(R.id.mVideo).setOnClickListener { setMode(true) }
@@ -118,9 +127,9 @@ class MainActivity : AppCompatActivity() {
                 if (r != rotation) { rotation = r; imageCapture?.targetRotation = r; if (recording == null) videoCapture?.targetRotation = r }
             }
         }.enable()
-        val need = mutableListOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
+        val need = mutableListOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO, Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION)
         if (Build.VERSION.SDK_INT < 29) need += Manifest.permission.WRITE_EXTERNAL_STORAGE
-        if (need.all { has(it) }) startCamera() else perms.launch(need.toTypedArray())
+        if (need.all { has(it) }) { startCamera(); startLocation() } else perms.launch(need.toTypedArray())
     }
 
     private fun has(p: String) = ContextCompat.checkSelfPermission(this, p) == PackageManager.PERMISSION_GRANTED
@@ -292,7 +301,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun capture(ic: ImageCapture) {
         val fx = findViewById<View>(R.id.flashFx); fx.alpha = 0.8f; fx.animate().alpha(0f).setDuration(350)
-        val t = Names.now(); val d = wm.data
+        val t = Names.now(); val d = wm.data; val loc = Geo.loc
         ic.takePicture(bg, object : ImageCapture.OnImageCapturedCallback() {
             override fun onCaptureSuccess(image: ImageProxy) {
                 try {
@@ -305,10 +314,10 @@ class MainActivity : AppCompatActivity() {
                         Watermark.stamp(Canvas(out), out.width.toFloat(), out.height.toFloat(), d, t)
                         val name = Names.base(t, d.case_) + ".jpg"; val tmp = File(cacheDir, "o.jpg")
                         tmp.outputStream().use { out.compress(Bitmap.CompressFormat.JPEG, 98, it) }; out.recycle()
-                        publishJpeg(tmp, name); toast("已儲存 $name"); return
+                        writeGps(tmp, loc); publishJpeg(tmp, name); toast("已儲存 $name"); return
                     }
                     val name = Names.base(t, d.case_) + ".jpg"
-                    processJpeg(bytes, d, t, name); toast("已儲存 $name")
+                    processJpeg(bytes, d, t, name, loc); toast("已儲存 $name")
                 } catch (e: Throwable) { toast("儲存失敗：${e.message}") }
             }
             override fun onError(e: ImageCaptureException) { toast("拍照失敗：${e.message}") }
@@ -316,7 +325,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     /** 原尺寸解碼 → 依 EXIF 轉正 → 加浮水印 → 品質 98 重新編碼 → 複製原 EXIF */
-    private fun processJpeg(bytes: ByteArray, d: WmData, t: java.time.ZonedDateTime, name: String) {
+    private fun processJpeg(bytes: ByteArray, d: WmData, t: java.time.ZonedDateTime, name: String, loc: Location? = null) {
         val src = File(cacheDir, "src.jpg"); src.writeBytes(bytes)
         val rot = ExifInterface(src).rotationDegrees
         val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, BitmapFactory.Options().apply { inSampleSize = 1; inPreferredConfig = Bitmap.Config.ARGB_8888; inMutable = rot == 0 })
@@ -326,7 +335,7 @@ class MainActivity : AppCompatActivity() {
         val tmp = File(cacheDir, "out.jpg")
         tmp.outputStream().use { out.compress(Bitmap.CompressFormat.JPEG, 98, it) }
         val w = out.width; val h = out.height; out.recycle()
-        copyExif(src, tmp, w, h); src.delete()
+        copyExif(src, tmp, w, h); src.delete(); writeGps(tmp, loc)
         publishJpeg(tmp, name)
     }
 
@@ -342,9 +351,14 @@ class MainActivity : AppCompatActivity() {
             for (tag in EXIF_TAGS) a.getAttribute(tag)?.let { b.setAttribute(tag, it) }
             b.setAttribute(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL.toString())
             b.setAttribute(ExifInterface.TAG_PIXEL_X_DIMENSION, w.toString()); b.setAttribute(ExifInterface.TAG_PIXEL_Y_DIMENSION, h.toString())
-            b.setAttribute(ExifInterface.TAG_SOFTWARE, "時間相機 1.0.1")
+            b.setAttribute(ExifInterface.TAG_SOFTWARE, "時間相機 1.1.0")
             b.saveAttributes()
         }
+    }
+
+    private fun writeGps(f: File, loc: Location?) {
+        if (loc == null) return
+        runCatching { ExifInterface(f).apply { setGpsInfo(loc); saveAttributes() } }
     }
 
     private fun rotateInto(src: Bitmap, rot: Int): Bitmap {
@@ -392,16 +406,17 @@ class MainActivity : AppCompatActivity() {
                 put(MediaStore.Video.Media.DISPLAY_NAME, name); put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
                 put(MediaStore.Video.Media.RELATIVE_PATH, "DCIM/時間相機")
             }
-            vc.output.prepareRecording(this, MediaStoreOutputOptions.Builder(contentResolver, MediaStore.Video.Media.EXTERNAL_CONTENT_URI).setContentValues(v).build())
-        } else vc.output.prepareRecording(this, FileOutputOptions.Builder(File(legacyDir, name)).build())
+            vc.output.prepareRecording(this, MediaStoreOutputOptions.Builder(contentResolver, MediaStore.Video.Media.EXTERNAL_CONTENT_URI).setContentValues(v).setLocation(Geo.loc).build())
+        } else vc.output.prepareRecording(this, FileOutputOptions.Builder(File(legacyDir, name)).setLocation(Geo.loc).build())
         if (has(Manifest.permission.RECORD_AUDIO)) pending.withAudioEnabled() else toast("未取得麥克風權限，將錄製無聲影片")
         val recLbl = findViewById<TextView>(R.id.rec)
+        recData = WmData.load(this)  // 錄影期間地址固定
         recording = pending.start(ContextCompat.getMainExecutor(this)) { ev ->
             when (ev) {
                 is VideoRecordEvent.Start -> { shutter.recording = true; recLbl.visibility = View.VISIBLE; recLbl.text = "●  00:00" }
                 is VideoRecordEvent.Status -> { val s = TimeUnit.NANOSECONDS.toSeconds(ev.recordingStats.recordedDurationNanos); recLbl.text = String.format("●  %02d:%02d", s / 60, s % 60) }
                 is VideoRecordEvent.Finalize -> {
-                    shutter.recording = false; recLbl.visibility = View.GONE; recording = null
+                    shutter.recording = false; recLbl.visibility = View.GONE; recording = null; recData = null
                     if (ev.hasError() && ev.error != VideoRecordEvent.Finalize.ERROR_SOURCE_INACTIVE) toast("錄影失敗（${ev.error}）")
                     else { toast("已儲存 $name"); if (Build.VERSION.SDK_INT < 29) MediaScannerConnection.scanFile(this, arrayOf(File(legacyDir, name).path), arrayOf("video/mp4"), null) }
                 }
@@ -414,17 +429,121 @@ class MainActivity : AppCompatActivity() {
         val dlg = BottomSheetDialog(this, R.style.SheetTheme)
         val v = layoutInflater.inflate(R.layout.sheet, null); dlg.setContentView(v)
         val d = wm.data
-        listOf(R.id.fSite to "site", R.id.fCase to "case", R.id.fBld to "bld", R.id.fFlr to "flr", R.id.fNote to "note").forEach { (id, key) ->
+        listOf(R.id.fSite to "site", R.id.fCase to "case", R.id.fBld to "bld", R.id.fFlr to "flr", R.id.fNote to "note", R.id.fAddr to "addr").forEach { (id, key) ->
             val et = v.findViewById<EditText>(id)
-            et.setText(when (key) { "site" -> d.site; "case" -> d.case_; "bld" -> d.bld; "flr" -> d.flr; else -> d.note })
+            et.setText(WmData.prefs(this).getString(key, if (key == "site") "中和安邦社宅" else ""))
             et.addTextChangedListener(object : TextWatcher {
-                override fun afterTextChanged(s: Editable?) { WmData.save(this@MainActivity, key, s.toString()); wm.data = WmData.load(this@MainActivity); wm.invalidate(); refreshSite() }
+                override fun afterTextChanged(s: Editable?) { WmData.save(this@MainActivity, key, s.toString()); wm.reload(); refreshSite(); renderTpls() }
                 override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}; override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
             })
         }
+        sheetView = v
+        val pr = WmData.prefs(this)
+        v.findViewById<androidx.appcompat.widget.SwitchCompat>(R.id.swAddr).apply { isChecked = pr.getBoolean("showAddr", true)
+            setOnCheckedChangeListener { _, b -> pr.edit().putBoolean("showAddr", b).apply(); wm.reload(); renderTpls() } }
+        v.findViewById<androidx.appcompat.widget.SwitchCompat>(R.id.swGeo).apply { isChecked = pr.getBoolean("showGeo", true)
+            setOnCheckedChangeListener { _, b -> pr.edit().putBoolean("showGeo", b).apply(); wm.reload(); renderTpls() } }
+        v.findViewById<View>(R.id.refreshLoc).setOnClickListener { refreshLocation() }
+        segRow(v.findViewById(R.id.posRow), WmData.POS, "pos", 0); segRow(v.findViewById(R.id.sizeRow), WmData.SIZES, "size", 1)
+        renderTpls(); updateGeoStatus()
         v.findViewById<View>(R.id.done).setOnClickListener { dlg.dismiss() }
+        dlg.setOnDismissListener { sheetView = null }
+        dlg.behavior.state = com.google.android.material.bottomsheet.BottomSheetBehavior.STATE_EXPANDED
+        dlg.behavior.skipCollapsed = true
         dlg.show()
     }
+
+    private var sheetView: View? = null
+
+    private fun segRow(row: LinearLayout, items: List<String>, key: String, def: Int) {
+        row.removeAllViews(); val pr = WmData.prefs(this)
+        items.forEachIndexed { i, label ->
+            val tv = TextView(this).apply { text = label; textSize = 13f; gravity = Gravity.CENTER; setPadding(dp(11), 0, dp(11), 0); setTypeface(typeface, Typeface.BOLD) }
+            row.addView(tv, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(28)))
+            tv.setOnClickListener { pr.edit().putInt(key, i).apply(); wm.reload(); segRow(row, items, key, def) }
+            val on = pr.getInt(key, def) == i
+            tv.setTextColor(if (on) Watermark.AC else 0xB3FFFFFF.toInt()); if (on) tv.setBackgroundResource(R.drawable.seg_on)
+        }
+    }
+
+    private fun renderTpls() {
+        val row = sheetView?.findViewById<LinearLayout>(R.id.tplRow) ?: return
+        row.removeAllViews(); val d = WmData.load(this); val pr = WmData.prefs(this)
+        WmData.TEMPLATES.forEachIndexed { i, name ->
+            val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_HORIZONTAL; setPadding(dp(3), dp(3), dp(3), dp(3)) }
+            val img = ImageView(this).apply {
+                setImageBitmap(Watermark.thumbnail(d, i, 480, 360)); scaleType = ImageView.ScaleType.FIT_CENTER
+                val sel = pr.getInt("tpl", 0) == i
+                background = android.graphics.drawable.GradientDrawable().apply { cornerRadius = dp(10).toFloat(); setStroke(dp(if (sel) 3 else 1), if (sel) Watermark.AC else 0x33FFFFFF) }
+                setPadding(dp(3), dp(3), dp(3), dp(3)); clipToOutline = true
+            }
+            col.addView(img, LinearLayout.LayoutParams(dp(128), dp(96)))
+            col.addView(TextView(this).apply { text = name; textSize = 12f; setTextColor(if (pr.getInt("tpl", 0) == i) Watermark.AC else Color.WHITE); setPadding(0, dp(4), 0, 0) })
+            col.setOnClickListener { pr.edit().putInt("tpl", i).apply(); wm.reload(); renderTpls() }
+            row.addView(col)
+        }
+    }
+
+    // ---------- 定位 ----------
+    private fun hasLoc() = has(Manifest.permission.ACCESS_FINE_LOCATION) || has(Manifest.permission.ACCESS_COARSE_LOCATION)
+
+    @SuppressLint("MissingPermission")
+    private fun startLocation() {
+        if (!hasLoc()) { Geo.status = "無法定位（未授權）"; updateGeoStatus(); return }
+        val m = lm ?: getSystemService(LocationManager::class.java).also { lm = it }
+        m.removeUpdates(locListener)
+        val ps = listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER).filter { runCatching { m.isProviderEnabled(it) }.getOrDefault(false) && m.allProviders.contains(it) }
+        if (ps.isEmpty()) { Geo.status = "無法定位（請開啟定位服務）"; updateGeoStatus(); return }
+        if (Geo.loc == null) Geo.status = "定位中…"
+        ps.forEach { pv -> runCatching { m.getLastKnownLocation(pv)?.let { if (System.currentTimeMillis() - it.time < 10 * 60_000) onLoc(it) }; m.requestLocationUpdates(pv, 5000L, 5f, locListener, mainLooper) } }
+        updateGeoStatus()
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun refreshLocation() {
+        if (!hasLoc()) { perms.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION)); return }
+        Geo.addrStatus = ""; lastGeoLoc = null; Geo.status = "定位中…"; toast("重新定位中…")
+        val m = lm ?: getSystemService(LocationManager::class.java).also { lm = it }
+        val pv = if (m.isProviderEnabled(LocationManager.GPS_PROVIDER)) LocationManager.GPS_PROVIDER else LocationManager.NETWORK_PROVIDER
+        runCatching {
+            if (Build.VERSION.SDK_INT >= 30) m.getCurrentLocation(pv, null, mainExecutor) { l -> if (l != null) { Geo.loc = null; onLoc(l) } else startLocation() }
+            else @Suppress("DEPRECATION") m.requestSingleUpdate(pv, { l -> Geo.loc = null; onLoc(l) }, mainLooper)
+        }.onFailure { startLocation() }
+        Geo.loc?.let { geocode(it) }
+    }
+
+    private fun onLoc(l: Location) {
+        val cur = Geo.loc
+        if (cur != null && l.accuracy > cur.accuracy * 1.5f && l.time - cur.time < 20_000) return
+        Geo.loc = l; Geo.status = ""
+        val now = SystemClock.elapsedRealtime()
+        if (lastGeoLoc == null || l.distanceTo(lastGeoLoc!!) > 30 || now - lastGeoAt > 60_000) geocode(l)
+        wm.reload(); updateGeoStatus()
+    }
+
+    private fun geocode(l: Location) {
+        lastGeoLoc = l; lastGeoAt = SystemClock.elapsedRealtime()
+        if (!Geocoder.isPresent()) { Geo.addrStatus = "此裝置無法查詢地址"; return }
+        bg.execute {
+            try {
+                @Suppress("DEPRECATION")
+                val a = Geocoder(this, Locale.TAIWAN).getFromLocation(l.latitude, l.longitude, 1)?.firstOrNull()?.getAddressLine(0)
+                if (a != null) { Geo.addr = cleanAddr(a); Geo.addrStatus = "" } else if (Geo.addr.isEmpty()) Geo.addrStatus = "查無地址"
+            } catch (e: Exception) { if (Geo.addr.isEmpty()) Geo.addrStatus = "地址無法取得（離線）" }
+            runOnUiThread { wm.reload(); updateGeoStatus() }
+        }
+    }
+
+    private fun cleanAddr(s: String) = s.trim().replace(Regex("^\\d{3,6}"), "").replace(Regex("^(台灣|臺灣)"), "").replace(Regex("^\\d{3,6}"), "").trim()
+
+    private fun updateGeoStatus() {
+        val tv = sheetView?.findViewById<TextView>(R.id.geoStatus) ?: return
+        val l = Geo.loc
+        tv.text = if (l == null) Geo.status else "自動：" + Geo.addr.ifBlank { Geo.addrStatus.ifBlank { "地址查詢中…" } } + "\n" + Geo.coords(l)
+    }
+
+    override fun onResume() { super.onResume(); if (hasLoc()) startLocation() }
+    override fun onPause() { lm?.removeUpdates(locListener); super.onPause() }
 
     override fun onDestroy() { recording?.stop(); effectThread.quitSafely(); bg.shutdown(); super.onDestroy() }
 }

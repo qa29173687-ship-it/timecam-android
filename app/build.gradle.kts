@@ -4,7 +4,7 @@ val ksProps = Properties().apply { val f = rootProject.file("keystore/keystore.p
 android {
     namespace = "tw.timecam"
     compileSdk = 35
-    defaultConfig { applicationId = "tw.timecam"; minSdk = 26; targetSdk = 35; versionCode = 2; versionName = "1.0.1" }
+    defaultConfig { applicationId = "tw.timecam"; minSdk = 26; targetSdk = 35; versionCode = 3; versionName = "1.1.0" }
     signingConfigs {
         if (ksProps.isNotEmpty()) create("release") {
             storeFile = rootProject.file("keystore/" + ksProps["storeFile"]); storePassword = ksProps["storePassword"] as String
@@ -15,6 +15,7 @@ android {
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
     kotlinOptions { jvmTarget = "17" }
     lint { abortOnError = false }
+    testOptions { unitTests.isIncludeAndroidResources = true }
 }
 dependencies {
     val cx = "1.4.0"
@@ -25,4 +26,5 @@ dependencies {
     implementation("androidx.core:core-ktx:1.13.1"); implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("com.google.android.material:material:1.12.0"); implementation("androidx.exifinterface:exifinterface:1.3.7")
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.robolectric:robolectric:4.14.1")
 }

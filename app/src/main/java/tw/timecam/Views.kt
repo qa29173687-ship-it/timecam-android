@@ -6,15 +6,17 @@ import android.util.AttributeSet
 import android.view.View
 
 class WatermarkView(ctx: Context, a: AttributeSet?) : View(ctx, a) {
-    var data: WmData = WmData.load(ctx)
+    @Volatile var data: WmData = WmData.load(ctx)
     var bottomInset = 0f
-    private val tick = object : Runnable { override fun run() { invalidate(); postDelayed(this, 500) } }
+    var topInset = 0f
+    fun reload() { data = WmData.load(context); invalidate() }
+    private val tick = object : Runnable { override fun run() { reload(); postDelayed(this, 500) } }
     override fun onAttachedToWindow() { super.onAttachedToWindow(); post(tick) }
     override fun onDetachedFromWindow() { removeCallbacks(tick); super.onDetachedFromWindow() }
     override fun onDraw(c: Canvas) {
         val dp = resources.displayMetrics.density
         val u = minOf(width, height) * 0.03f
-        Watermark.draw(c, data, Names.now(), u, 14 * dp, height - bottomInset - 6 * dp, width - 28 * dp)
+        Watermark.render(c, data, Names.now(), u, RectF(0f, topInset, width.toFloat(), height - bottomInset), 12 * dp)
     }
 }
 
