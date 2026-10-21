@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android" android:layout_width="match_parent" android:layout_height="wrap_content"
+    android:orientation="vertical" android:background="@drawable/sheet_bg" android:layout_margin="8dp" android:paddingStart="18dp" android:paddingEnd="18dp" android:paddingTop="10dp" android:paddingBottom="16dp">
+    <View android:layout_width="40dp" android:layout_height="5dp" android:background="@drawable/grab" android:layout_gravity="center_horizontal" android:layout_marginBottom="12dp"/>
+    <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:gravity="center_vertical" android:layout_marginBottom="10dp">
+        <TextView android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content" android:text="浮水印資訊" android:textSize="17sp" android:textStyle="bold" android:textColor="#FFF"/>
+        <TextView android:id="@+id/done" android:layout_width="wrap_content" android:layout_height="34dp" android:gravity="center" android:background="@drawable/done_btn" android:paddingStart="18dp" android:paddingEnd="18dp" android:text="完成" android:textColor="#111" android:textStyle="bold"/>
+    </LinearLayout>
+    <TextView style="@style/FieldLabel" android:text="社宅名稱"/><EditText android:id="@+id/fSite" style="@style/Field" android:hint="中和安邦社宅"/>
+    <TextView style="@style/FieldLabel" android:text="案號"/><EditText android:id="@+id/fCase" style="@style/Field" android:hint="例：A-1023"/>
+    <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content">
+        <LinearLayout android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content" android:orientation="vertical" android:layout_marginEnd="5dp">
+            <TextView style="@style/FieldLabel" android:text="棟別"/><EditText android:id="@+id/fBld" style="@style/Field" android:hint="例：B棟"/></LinearLayout>
+        <LinearLayout android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content" android:orientation="vertical" android:layout_marginStart="5dp">
+            <TextView style="@style/FieldLabel" android:text="樓層"/><EditText android:id="@+id/fFlr" style="@style/Field" android:hint="例：5F"/></LinearLayout>
+    </LinearLayout>
+    <TextView style="@style/FieldLabel" android:text="備註"/><EditText android:id="@+id/fNote" style="@style/Field" android:hint="例：浴室漏水"/>
+</LinearLayout>
