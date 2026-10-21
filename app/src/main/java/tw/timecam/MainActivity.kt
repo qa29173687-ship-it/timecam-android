@@ -99,11 +99,9 @@ class MainActivity : AppCompatActivity() {
         previewView.setBackgroundColor(Color.WHITE)
         previewView.implementationMode = PreviewView.ImplementationMode.PERFORMANCE
         val top = findViewById<View>(R.id.top); val ctrl = findViewById<View>(R.id.ctrl)
-        ViewCompat.setOnApplyWindowInsetsListener(findViewById(R.id.root)) { _, ins ->
-            val b = ins.getInsets(WindowInsetsCompat.Type.systemBars())
-            top.setPadding(top.paddingLeft, b.top + dp(12), top.paddingRight, top.paddingBottom)
-            ctrl.setPadding(ctrl.paddingLeft, ctrl.paddingTop, ctrl.paddingRight, b.bottom + dp(18)); ins
-        }
+        // 工具列避開狀態列／瀏海，控制列避開導覽列（三鍵或手勢）
+        EdgeInsets.pad(top, bottom = false) { top.post { updateFrame() } }
+        EdgeInsets.pad(ctrl, top = false) { ctrl.post { updateFrame() } }
         ctrl.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> ctrl.post { updateFrame() } }
         top.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> top.post { updateFrame() } }
         refreshSite()
@@ -393,7 +391,7 @@ class MainActivity : AppCompatActivity() {
             for (tag in EXIF_TAGS) a.getAttribute(tag)?.let { b.setAttribute(tag, it) }
             b.setAttribute(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL.toString())
             b.setAttribute(ExifInterface.TAG_PIXEL_X_DIMENSION, w.toString()); b.setAttribute(ExifInterface.TAG_PIXEL_Y_DIMENSION, h.toString())
-            b.setAttribute(ExifInterface.TAG_SOFTWARE, "時間相機 1.1.4")
+            b.setAttribute(ExifInterface.TAG_SOFTWARE, "時間相機 1.1.5")
             b.saveAttributes()
         }
     }
@@ -504,6 +502,7 @@ class MainActivity : AppCompatActivity() {
     private fun openSheet() {
         val dlg = BottomSheetDialog(this, R.style.SheetTheme)
         val v = layoutInflater.inflate(R.layout.sheet, null); dlg.setContentView(v)
+        EdgeInsets.pad(v, top = false, ime = true)
         val d = wm.data
         listOf(R.id.fSite to "site", R.id.fCase to "case", R.id.fBld to "bld", R.id.fFlr to "flr", R.id.fNote to "note", R.id.fAddr to "addr").forEach { (id, key) ->
             val et = v.findViewById<EditText>(id)
