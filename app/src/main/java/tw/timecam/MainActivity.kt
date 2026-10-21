@@ -3,7 +3,6 @@ package tw.timecam
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.ContentValues
-import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.*
 import android.media.MediaScannerConnection
@@ -123,9 +122,6 @@ class MainActivity : AppCompatActivity() {
         }
         findViewById<TextView>(R.id.btnExt).setOnClickListener { cycleExt() }
         setupGestures(); setupSliders()
-        findViewById<View>(R.id.btnUpload).setOnClickListener { lastSaved?.let { upload(listOf(it)) } }
-        findViewById<View>(R.id.btnMulti).setOnClickListener { pickRecent() }
-        findViewById<View>(R.id.btnClose).setOnClickListener { findViewById<View>(R.id.lastBar).visibility = View.GONE }
         object : OrientationEventListener(this) {
             override fun onOrientationChanged(o: Int) {
                 if (o == ORIENTATION_UNKNOWN) return
@@ -328,7 +324,7 @@ class MainActivity : AppCompatActivity() {
         ic.takePicture(ImageCapture.OutputFileOptions.Builder(src).build(), bg, object : ImageCapture.OnImageSavedCallback {
             override fun onImageSaved(r: ImageCapture.OutputFileResults) {
                 val name = Names.base(t, d.case_) + ".jpg"
-                try { processFile(src, d, t, name, loc); toast("已儲存 $name") }
+                try { processFile(src, d, t, name, loc); toast("已儲存到相簿") }
                 catch (e: Throwable) { toast("儲存失敗：${e.message}") } finally { src.delete() }
             }
             override fun onError(e: ImageCaptureException) { src.delete(); toast("拍照失敗：${e.message}") }
@@ -397,7 +393,7 @@ class MainActivity : AppCompatActivity() {
             for (tag in EXIF_TAGS) a.getAttribute(tag)?.let { b.setAttribute(tag, it) }
             b.setAttribute(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL.toString())
             b.setAttribute(ExifInterface.TAG_PIXEL_X_DIMENSION, w.toString()); b.setAttribute(ExifInterface.TAG_PIXEL_Y_DIMENSION, h.toString())
-            b.setAttribute(ExifInterface.TAG_SOFTWARE, "時間相機 1.1.3")
+            b.setAttribute(ExifInterface.TAG_SOFTWARE, "時間相機 1.1.4")
             b.saveAttributes()
         }
     }
@@ -422,7 +418,7 @@ class MainActivity : AppCompatActivity() {
         try {
             val t = Names.now(); val d = wm.data
             contentResolver.openInputStream(uri)!!.use { i -> src.outputStream().use { i.copyTo(it) } }
-            val name = Names.base(t, d.case_) + ".jpg"; processFile(src, d, t, name, null); toast("已儲存 $name")
+            val name = Names.base(t, d.case_) + ".jpg"; processFile(src, d, t, name, null); toast("已儲存到相簿")
         } catch (e: OutOfMemoryError) { toast("相片過大，無法處理") } catch (e: Throwable) { toast("處理失敗：${e.message}") } finally { src.delete() }
     }
 
@@ -452,12 +448,11 @@ class MainActivity : AppCompatActivity() {
                 if (contentResolver.update(uri, done, null, null) != 1) error("無法完成相簿登錄")
             } catch (e: Throwable) { runCatching { contentResolver.delete(uri, null, null) }; throw e }
             tmp.delete()
-            onSaved(uri, "image/jpeg", name)
             rescan(uri, "image/jpeg")
         } else {
             val f = File(legacyDir, name); tmp.copyTo(f, overwrite = true); tmp.delete()
             f.setLastModified(takenMs)
-            MediaScannerConnection.scanFile(this, arrayOf(f.path), arrayOf("image/jpeg")) { _, u -> if (u != null) onSaved(u, "image/jpeg", name) }
+            MediaScannerConnection.scanFile(this, arrayOf(f.path), arrayOf("image/jpeg"), null)
         }
     }
 
@@ -495,11 +490,11 @@ class MainActivity : AppCompatActivity() {
                 is VideoRecordEvent.Finalize -> {
                     shutter.recording = false; recLbl.visibility = View.GONE; recording = null; recData = null
                     if (ev.hasError() && ev.error != VideoRecordEvent.Finalize.ERROR_SOURCE_INACTIVE) toast("錄影失敗（${ev.error}）")
-                    else { toast("已儲存 $name")
-                        if (Build.VERSION.SDK_INT < 29) MediaScannerConnection.scanFile(this, arrayOf(File(legacyDir, name).path), arrayOf("video/mp4")) { _, u -> if (u != null) onSaved(u, "video/mp4", name) }
+                    else { toast("已儲存到相簿")
+                        if (Build.VERSION.SDK_INT < 29) MediaScannerConnection.scanFile(this, arrayOf(File(legacyDir, name).path), arrayOf("video/mp4"), null)
                         else { val u = ev.outputResults.outputUri
                             runCatching { contentResolver.update(u, ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }, null, null) }
-                            onSaved(u, "video/mp4", name); rescan(u, "video/mp4") } }
+                            rescan(u, "video/mp4") } }
                 }
             }
         }
@@ -535,46 +530,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private var sheetView: View? = null
-
-    // ---------- 上傳（交給 Google 雲端硬碟） ----------
-    data class Saved(val uri: Uri, val mime: String, val name: String)
-    private var lastSaved: Saved? = null
-    private fun onSaved(uri: Uri, mime: String, name: String) = runOnUiThread {
-        val s = Saved(uri, mime, name); lastSaved = s
-        val pr = WmData.prefs(this)
-        val list = (listOf("$uri|$mime|$name") + (pr.getString("recent", "") ?: "").split("\n").filter { it.isNotBlank() && !it.startsWith("$uri|") }).take(30)
-        pr.edit().putString("recent", list.joinToString("\n")).apply()
-        findViewById<TextView>(R.id.lastName).text = name
-        findViewById<View>(R.id.lastBar).visibility = View.VISIBLE
-    }
-    private fun recent(): List<Saved> = (WmData.prefs(this).getString("recent", "") ?: "").split("\n").mapNotNull {
-        val p = it.split("|"); if (p.size < 3) null else Saved(Uri.parse(p[0]), p[1], p.drop(2).joinToString("|"))
-    }.filter { s -> runCatching { contentResolver.openFileDescriptor(s.uri, "r")?.use { true } ?: false }.getOrDefault(false) }
-
-    private fun pickRecent() {
-        val items = recent()
-        if (items.isEmpty()) { toast("沒有最近的拍攝紀錄"); return }
-        val checked = BooleanArray(items.size) { it == 0 }
-        androidx.appcompat.app.AlertDialog.Builder(this).setTitle("選擇要上傳的檔案")
-            .setMultiChoiceItems(items.map { (if (it.mime.startsWith("video")) "🎬 " else "📷 ") + it.name }.toTypedArray(), checked) { _, i, b -> checked[i] = b }
-            .setPositiveButton("上傳") { _, _ -> val sel = items.filterIndexed { i, _ -> checked[i] }; if (sel.isEmpty()) toast("未選擇檔案") else upload(sel) }
-            .setNegativeButton("取消", null).show()
-    }
-
-    private fun upload(files: List<Saved>) {
-        val mime = when { files.all { it.mime.startsWith("image") } -> "image/jpeg"; files.all { it.mime.startsWith("video") } -> "video/mp4"; else -> "*/*" }
-        val send = if (files.size == 1) Intent(Intent.ACTION_SEND).apply { putExtra(Intent.EXTRA_STREAM, files[0].uri) }
-            else Intent(Intent.ACTION_SEND_MULTIPLE).apply { putParcelableArrayListExtra(Intent.EXTRA_STREAM, ArrayList(files.map { it.uri })) }
-        send.type = mime; send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        send.clipData = android.content.ClipData.newRawUri(files[0].name, files[0].uri).apply { files.drop(1).forEach { addItem(android.content.ClipData.Item(it.uri)) } }
-        val drive = "com.google.android.apps.docs"
-        val hasDrive = runCatching { packageManager.getPackageInfo(drive, 0); true }.getOrDefault(false)
-        if (hasDrive) {
-            try { startActivity(Intent(send).setPackage(drive)); return } catch (e: Exception) { }
-        }
-        toast("未安裝 Google 雲端硬碟，改用分享")
-        startActivity(Intent.createChooser(send, "上傳／分享"))
-    }
 
     private fun segRow(row: LinearLayout, items: List<String>, key: String, def: Int) {
         row.removeAllViews(); val pr = WmData.prefs(this)
