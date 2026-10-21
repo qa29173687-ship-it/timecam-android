@@ -19,6 +19,8 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.*
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
+import android.util.Size
 import androidx.camera.effects.OverlayEffect
 import androidx.camera.extensions.ExtensionMode
 import androidx.camera.extensions.ExtensionsManager
@@ -53,6 +55,7 @@ class MainActivity : AppCompatActivity() {
     private var torchOn = false
     private var extMode = ExtensionMode.NONE
     private var rotation = Surface.ROTATION_0
+    private var lastTap = 0L
     private val effectThread = HandlerThread("overlay").apply { start() }
     private val overlay by lazy {
         OverlayEffect(CameraEffect.VIDEO_CAPTURE, 0, Handler(effectThread.looper)) { toast("浮水印錯誤：${it.message}") }.apply {
@@ -84,6 +87,7 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
         previewView = findViewById(R.id.preview); wm = findViewById(R.id.wm); shutter = findViewById(R.id.shutter)
         previewView.scaleType = PreviewView.ScaleType.FILL_CENTER
+        previewView.implementationMode = PreviewView.ImplementationMode.PERFORMANCE
         val top = findViewById<View>(R.id.top); val ctrl = findViewById<View>(R.id.ctrl)
         ViewCompat.setOnApplyWindowInsetsListener(findViewById(R.id.root)) { _, ins ->
             val b = ins.getInsets(WindowInsetsCompat.Type.systemBars())
@@ -136,29 +140,38 @@ class MainActivity : AppCompatActivity() {
     private fun baseSelector() = CameraSelector.Builder().requireLensFacing(lensFacing).build()
     private fun supportedExt(): List<Int> {
         val m = extMgr ?: return listOf(ExtensionMode.NONE)
-        return listOf(ExtensionMode.NONE) + listOf(ExtensionMode.HDR, ExtensionMode.NIGHT).filter { runCatching { m.isExtensionAvailable(baseSelector(), it) }.getOrDefault(false) }
+        return listOf(ExtensionMode.NONE) + listOf(ExtensionMode.AUTO, ExtensionMode.HDR, ExtensionMode.NIGHT).filter { runCatching { m.isExtensionAvailable(baseSelector(), it) }.getOrDefault(false) }
     }
-    private fun extName(m: Int) = when (m) { ExtensionMode.HDR -> "HDR"; ExtensionMode.NIGHT -> "夜間"; else -> "標準" }
+    private fun extName(m: Int) = when (m) { ExtensionMode.AUTO -> "自動"; ExtensionMode.HDR -> "HDR"; ExtensionMode.NIGHT -> "夜間"; else -> "標準" }
 
     private fun bind() {
         val p = provider ?: return
         p.unbindAll(); camera = null
         val ratio = if (videoMode) AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY else AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY
-        val rs = ResolutionSelector.Builder().setAspectRatioStrategy(ratio).build()
-        val preview = Preview.Builder().setResolutionSelector(rs).build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
+        val prevSize = if (videoMode) Size(1920, 1080) else Size(1920, 1440)
+        val prs = ResolutionSelector.Builder().setAspectRatioStrategy(ratio)
+            .setResolutionStrategy(ResolutionStrategy(prevSize, ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER)).build()
+        val rs = ResolutionSelector.Builder().setAspectRatioStrategy(ratio).setResolutionStrategy(ResolutionStrategy.HIGHEST_AVAILABLE_STRATEGY)
+            .setAllowedResolutionMode(ResolutionSelector.PREFER_HIGHER_RESOLUTION_OVER_CAPTURE_RATE).build()
+        val preview = Preview.Builder().setResolutionSelector(prs).build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
         try {
             if (!videoMode) {
                 val ic = ImageCapture.Builder().setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY).setFlashMode(flashMode)
-                    .setResolutionSelector(rs).setTargetRotation(rotation).build()
+                    .setResolutionSelector(rs).setJpegQuality(100).setTargetRotation(rotation).build()
                 imageCapture = ic; videoCapture = null
                 val sel = if (extMode != ExtensionMode.NONE && extMgr != null) extMgr!!.getExtensionEnabledCameraSelector(baseSelector(), extMode) else baseSelector()
                 camera = p.bindToLifecycle(this, sel, preview, ic)
             } else {
-                val rec = Recorder.Builder().setQualitySelector(QualitySelector.from(Quality.FHD, FallbackStrategy.lowerQualityOrHigherThan(Quality.SD))).build()
-                val vc = VideoCapture.withOutput(rec).also { it.targetRotation = rotation }
-                videoCapture = vc; imageCapture = null
-                val g = UseCaseGroup.Builder().addUseCase(preview).addUseCase(vc).addEffect(overlay).build()
-                camera = p.bindToLifecycle(this, baseSelector(), g)
+                fun tryBind(qs: List<Quality>, bitrate: Int) {
+                    val rec = Recorder.Builder().setQualitySelector(QualitySelector.fromOrderedList(qs, FallbackStrategy.lowerQualityOrHigherThan(Quality.SD)))
+                        .setTargetVideoEncodingBitRate(bitrate).build()
+                    val vc = VideoCapture.withOutput(rec).also { it.targetRotation = rotation }
+                    videoCapture = vc; imageCapture = null
+                    val g = UseCaseGroup.Builder().addUseCase(preview).addUseCase(vc).addEffect(overlay).build()
+                    camera = p.bindToLifecycle(this, baseSelector(), g)
+                }
+                try { tryBind(listOf(Quality.UHD, Quality.FHD, Quality.HD), 40_000_000) }
+                catch (e: Exception) { p.unbindAll(); tryBind(listOf(Quality.FHD, Quality.HD), 20_000_000) }
             }
         } catch (e: Exception) { toast("相機啟動失敗：${e.message}"); return }
         observeCamera(); updateChips()
@@ -210,6 +223,7 @@ class MainActivity : AppCompatActivity() {
         val tap = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
             override fun onSingleTapUp(e: MotionEvent): Boolean {
                 val cam = camera ?: return false
+                lastTap = SystemClock.elapsedRealtime()
                 val pt = previewView.meteringPointFactory.createPoint(e.x, e.y)
                 cam.cameraControl.startFocusAndMetering(FocusMeteringAction.Builder(pt, FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE)
                     .setAutoCancelDuration(4, TimeUnit.SECONDS).build())
@@ -240,7 +254,7 @@ class MainActivity : AppCompatActivity() {
     private fun cycleExt() {
         if (videoMode) { toast("HDR／夜間僅適用於照片模式"); return }
         val list = supportedExt()
-        if (list.size == 1) { toast("此裝置不支援 HDR／夜間模式"); return }
+        if (list.size == 1) { toast("此裝置不支援 自動／HDR／夜間模式"); return }
         extMode = list[(list.indexOf(extMode) + 1) % list.size]; bind()
     }
     private fun updateChips() {
@@ -262,20 +276,75 @@ class MainActivity : AppCompatActivity() {
     // ---------- 照片 ----------
     private fun takePhoto() {
         val ic = imageCapture ?: return
+        val cam = camera
+        // 使用者剛點擊對焦則沿用；否則先對畫面中央對焦測光（最多等 800ms）
+        if (cam != null && SystemClock.elapsedRealtime() - lastTap > 4000) {
+            val pt = previewView.meteringPointFactory.createPoint(previewView.width / 2f, previewView.height / 2f)
+            val fut = cam.cameraControl.startFocusAndMetering(FocusMeteringAction.Builder(pt, FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE)
+                .setAutoCancelDuration(3, TimeUnit.SECONDS).build())
+            shutter.isEnabled = false
+            var fired = false
+            val go = { if (!fired) { fired = true; shutter.isEnabled = true; capture(ic) } }
+            fut.addListener({ go() }, ContextCompat.getMainExecutor(this))
+            previewView.postDelayed({ go() }, 800)
+        } else capture(ic)
+    }
+
+    private fun capture(ic: ImageCapture) {
         val fx = findViewById<View>(R.id.flashFx); fx.alpha = 0.8f; fx.animate().alpha(0f).setDuration(350)
         val t = Names.now(); val d = wm.data
         ic.takePicture(bg, object : ImageCapture.OnImageCapturedCallback() {
             override fun onCaptureSuccess(image: ImageProxy) {
                 try {
-                    val rot = image.imageInfo.rotationDegrees; val src = image.toBitmap(); image.close()
-                    val out = rotateInto(src, rot); src.recycle()
-                    Watermark.stamp(Canvas(out), out.width.toFloat(), out.height.toFloat(), d, t)
+                    val bytes: ByteArray
+                    if (image.format == ImageFormat.JPEG) {
+                        val buf = image.planes[0].buffer; bytes = ByteArray(buf.remaining()); buf.get(bytes); image.close()
+                    } else {
+                        val bmp = image.toBitmap(); val rot = image.imageInfo.rotationDegrees; image.close()
+                        val out = rotateInto(bmp, rot); bmp.recycle()
+                        Watermark.stamp(Canvas(out), out.width.toFloat(), out.height.toFloat(), d, t)
+                        val name = Names.base(t, d.case_) + ".jpg"; val tmp = File(cacheDir, "o.jpg")
+                        tmp.outputStream().use { out.compress(Bitmap.CompressFormat.JPEG, 98, it) }; out.recycle()
+                        publishJpeg(tmp, name); toast("已儲存 $name"); return
+                    }
                     val name = Names.base(t, d.case_) + ".jpg"
-                    saveJpeg(out, name); out.recycle(); toast("已儲存 $name")
+                    processJpeg(bytes, d, t, name); toast("已儲存 $name")
                 } catch (e: Throwable) { toast("儲存失敗：${e.message}") }
             }
             override fun onError(e: ImageCaptureException) { toast("拍照失敗：${e.message}") }
         })
+    }
+
+    /** 原尺寸解碼 → 依 EXIF 轉正 → 加浮水印 → 品質 98 重新編碼 → 複製原 EXIF */
+    private fun processJpeg(bytes: ByteArray, d: WmData, t: java.time.ZonedDateTime, name: String) {
+        val src = File(cacheDir, "src.jpg"); src.writeBytes(bytes)
+        val rot = ExifInterface(src).rotationDegrees
+        val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, BitmapFactory.Options().apply { inSampleSize = 1; inPreferredConfig = Bitmap.Config.ARGB_8888; inMutable = rot == 0 })
+            ?: error("無法解碼")
+        val out = if (rot == 0 && bmp.isMutable) bmp else rotateInto(bmp, rot).also { bmp.recycle() }
+        Watermark.stamp(Canvas(out), out.width.toFloat(), out.height.toFloat(), d, t)
+        val tmp = File(cacheDir, "out.jpg")
+        tmp.outputStream().use { out.compress(Bitmap.CompressFormat.JPEG, 98, it) }
+        val w = out.width; val h = out.height; out.recycle()
+        copyExif(src, tmp, w, h); src.delete()
+        publishJpeg(tmp, name)
+    }
+
+    private val EXIF_SKIP = setOf(ExifInterface.TAG_ORIENTATION, ExifInterface.TAG_IMAGE_WIDTH, ExifInterface.TAG_IMAGE_LENGTH,
+        ExifInterface.TAG_PIXEL_X_DIMENSION, ExifInterface.TAG_PIXEL_Y_DIMENSION, ExifInterface.TAG_THUMBNAIL_IMAGE_LENGTH, ExifInterface.TAG_THUMBNAIL_IMAGE_WIDTH,
+        ExifInterface.TAG_JPEG_INTERCHANGE_FORMAT, ExifInterface.TAG_JPEG_INTERCHANGE_FORMAT_LENGTH)
+    private val EXIF_TAGS: List<String> by lazy {
+        ExifInterface::class.java.fields.filter { it.name.startsWith("TAG_") && it.type == String::class.java }.mapNotNull { it.get(null) as? String }.filter { it !in EXIF_SKIP }.distinct()
+    }
+    private fun copyExif(from: File, to: File, w: Int, h: Int) {
+        runCatching {
+            val a = ExifInterface(from); val b = ExifInterface(to)
+            for (tag in EXIF_TAGS) a.getAttribute(tag)?.let { b.setAttribute(tag, it) }
+            b.setAttribute(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL.toString())
+            b.setAttribute(ExifInterface.TAG_PIXEL_X_DIMENSION, w.toString()); b.setAttribute(ExifInterface.TAG_PIXEL_Y_DIMENSION, h.toString())
+            b.setAttribute(ExifInterface.TAG_SOFTWARE, "時間相機 1.0.1")
+            b.saveAttributes()
+        }
     }
 
     private fun rotateInto(src: Bitmap, rot: Int): Bitmap {
@@ -289,32 +358,27 @@ class MainActivity : AppCompatActivity() {
     private fun stampPicked(uri: Uri) = bg.execute {
         try {
             val t = Names.now(); val d = wm.data
-            val opt = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-            contentResolver.openInputStream(uri)!!.use { BitmapFactory.decodeStream(it, null, opt) }
-            var sample = 1; while (maxOf(opt.outWidth, opt.outHeight) / sample > 5000) sample *= 2
-            val src = contentResolver.openInputStream(uri)!!.use { BitmapFactory.decodeStream(it, null, BitmapFactory.Options().apply { inSampleSize = sample }) }!!
-            val rot = contentResolver.openInputStream(uri)!!.use { ExifInterface(it).rotationDegrees }
-            val out = rotateInto(src, rot); src.recycle()
-            Watermark.stamp(Canvas(out), out.width.toFloat(), out.height.toFloat(), d, t)
-            val name = Names.base(t, d.case_) + ".jpg"; saveJpeg(out, name); out.recycle(); toast("已儲存 $name")
-        } catch (e: Throwable) { toast("處理失敗：${e.message}") }
+            val bytes = contentResolver.openInputStream(uri)!!.use { it.readBytes() }
+            val name = Names.base(t, d.case_) + ".jpg"; processJpeg(bytes, d, t, name); toast("已儲存 $name")
+        } catch (e: OutOfMemoryError) { toast("相片過大，無法處理") } catch (e: Throwable) { toast("處理失敗：${e.message}") }
     }
 
     private val legacyDir get() = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM), "時間相機").apply { mkdirs() }
 
-    private fun saveJpeg(b: Bitmap, name: String) {
+    private fun publishJpeg(tmp: File, name: String) {
         if (Build.VERSION.SDK_INT >= 29) {
             val v = ContentValues().apply {
                 put(MediaStore.Images.Media.DISPLAY_NAME, name); put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
                 put(MediaStore.Images.Media.RELATIVE_PATH, "DCIM/時間相機"); put(MediaStore.Images.Media.IS_PENDING, 1)
             }
             val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, v) ?: error("無法建立檔案")
-            contentResolver.openOutputStream(uri)!!.use { o: OutputStream -> b.compress(Bitmap.CompressFormat.JPEG, 95, o) }
+            contentResolver.openOutputStream(uri)!!.use { o: OutputStream -> tmp.inputStream().use { it.copyTo(o) } }
             v.clear(); v.put(MediaStore.Images.Media.IS_PENDING, 0); contentResolver.update(uri, v, null, null)
         } else {
-            val f = File(legacyDir, name); f.outputStream().use { b.compress(Bitmap.CompressFormat.JPEG, 95, it) }
+            val f = File(legacyDir, name); tmp.copyTo(f, overwrite = true)
             MediaScannerConnection.scanFile(this, arrayOf(f.path), arrayOf("image/jpeg"), null)
         }
+        tmp.delete()
     }
 
     // ---------- 錄影 ----------
