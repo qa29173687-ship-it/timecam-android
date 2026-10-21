@@ -367,8 +367,8 @@ class MainActivity : AppCompatActivity() {
         java.io.FileOutputStream(tmp).use { fo -> out.compress(Bitmap.CompressFormat.JPEG, 98, fo); fo.flush(); fo.fd.sync() }
         val w = out.width; val h = out.height; out.recycle()
         if (!ImageMath.jpegComplete(tail(tmp))) error("輸出檔不完整")
-        copyExif(src, tmp, w, h); writeGps(tmp, loc)
-        publishJpeg(tmp, name)
+        copyExif(src, tmp, w, h); writeTime(tmp, t); writeGps(tmp, loc)
+        publishJpeg(tmp, name, t.toInstant().toEpochMilli())
     }
 
     private fun orientInto(src: Bitmap, o: ImageMath.Orient): Bitmap {
@@ -397,9 +397,18 @@ class MainActivity : AppCompatActivity() {
             for (tag in EXIF_TAGS) a.getAttribute(tag)?.let { b.setAttribute(tag, it) }
             b.setAttribute(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL.toString())
             b.setAttribute(ExifInterface.TAG_PIXEL_X_DIMENSION, w.toString()); b.setAttribute(ExifInterface.TAG_PIXEL_Y_DIMENSION, h.toString())
-            b.setAttribute(ExifInterface.TAG_SOFTWARE, "時間相機 1.1.2")
+            b.setAttribute(ExifInterface.TAG_SOFTWARE, "時間相機 1.1.3")
             b.saveAttributes()
         }
+    }
+
+    /** 拍攝時間（含 +08:00 時區）寫入 EXIF，避免相簿以 UTC 誤判而排到 8 小時前 */
+    private fun writeTime(f: File, t: java.time.ZonedDateTime) {
+        runCatching { ExifInterface(f).apply {
+            val dt = t.format(java.time.format.DateTimeFormatter.ofPattern("yyyy:MM:dd HH:mm:ss")); val off = t.format(java.time.format.DateTimeFormatter.ofPattern("xxx"))
+            setAttribute(ExifInterface.TAG_DATETIME, dt); setAttribute(ExifInterface.TAG_DATETIME_ORIGINAL, dt); setAttribute(ExifInterface.TAG_DATETIME_DIGITIZED, dt)
+            setAttribute(ExifInterface.TAG_OFFSET_TIME, off); setAttribute(ExifInterface.TAG_OFFSET_TIME_ORIGINAL, off); setAttribute(ExifInterface.TAG_OFFSET_TIME_DIGITIZED, off)
+            saveAttributes() } }
     }
 
     private fun writeGps(f: File, loc: Location?) {
@@ -419,26 +428,47 @@ class MainActivity : AppCompatActivity() {
 
     private val legacyDir get() = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM), "時間相機").apply { mkdirs() }
 
-    private fun publishJpeg(tmp: File, name: String) {
-        var out: Uri? = null
+    /** 寫入相簿：完整中繼資料、IS_PENDING 生命週期、再掃描一次 */
+    private fun publishJpeg(tmp: File, name: String, takenMs: Long = System.currentTimeMillis()) {
+        val bo = BitmapFactory.Options().apply { inJustDecodeBounds = true }; BitmapFactory.decodeFile(tmp.path, bo)
+        val nowS = System.currentTimeMillis() / 1000
         if (Build.VERSION.SDK_INT >= 29) {
             val v = ContentValues().apply {
                 put(MediaStore.Images.Media.DISPLAY_NAME, name); put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-                put(MediaStore.Images.Media.RELATIVE_PATH, "DCIM/時間相機"); put(MediaStore.Images.Media.IS_PENDING, 1)
+                put(MediaStore.Images.Media.RELATIVE_PATH, "DCIM/時間相機")
+                put(MediaStore.Images.Media.DATE_TAKEN, takenMs)              // 毫秒
+                put(MediaStore.Images.Media.DATE_ADDED, nowS)                 // 秒
+                put(MediaStore.Images.Media.DATE_MODIFIED, nowS)              // 秒
+                put(MediaStore.Images.Media.WIDTH, bo.outWidth); put(MediaStore.Images.Media.HEIGHT, bo.outHeight)
+                put(MediaStore.Images.Media.ORIENTATION, 0)
+                put(MediaStore.Images.Media.IS_PENDING, 1)
             }
-            val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, v) ?: error("無法建立檔案")
+            val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, v) ?: error("無法建立相簿項目")
             try {
                 contentResolver.openOutputStream(uri, "wt")!!.use { o: OutputStream -> tmp.inputStream().use { it.copyTo(o) }; o.flush() }
                 val written = contentResolver.openFileDescriptor(uri, "r")!!.use { it.statSize }
                 if (written in 0 until tmp.length()) error("寫入不完整（$written/${tmp.length()}）")
-            } catch (e: Throwable) { contentResolver.delete(uri, null, null); throw e }
-            v.clear(); v.put(MediaStore.Images.Media.IS_PENDING, 0); contentResolver.update(uri, v, null, null); out = uri
+                val done = ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0); put(MediaStore.Images.Media.DATE_TAKEN, takenMs) }
+                if (contentResolver.update(uri, done, null, null) != 1) error("無法完成相簿登錄")
+            } catch (e: Throwable) { runCatching { contentResolver.delete(uri, null, null) }; throw e }
+            tmp.delete()
+            onSaved(uri, "image/jpeg", name)
+            rescan(uri, "image/jpeg")
         } else {
-            val f = File(legacyDir, name); tmp.copyTo(f, overwrite = true)
+            val f = File(legacyDir, name); tmp.copyTo(f, overwrite = true); tmp.delete()
+            f.setLastModified(takenMs)
             MediaScannerConnection.scanFile(this, arrayOf(f.path), arrayOf("image/jpeg")) { _, u -> if (u != null) onSaved(u, "image/jpeg", name) }
         }
-        tmp.delete()
-        out?.let { onSaved(it, "image/jpeg", name) }
+    }
+
+    /** 保險：以實際檔案路徑再請媒體掃描器掃一次 */
+    private fun rescan(uri: Uri, mime: String) {
+        runCatching {
+            @Suppress("DEPRECATION")
+            contentResolver.query(uri, arrayOf(MediaStore.MediaColumns.DATA), null, null, null)?.use { c ->
+                if (c.moveToFirst()) c.getString(0)?.let { p -> MediaScannerConnection.scanFile(this, arrayOf(p), arrayOf(mime), null) }
+            }
+        }
     }
 
     // ---------- 錄影 ----------
@@ -451,6 +481,7 @@ class MainActivity : AppCompatActivity() {
             val v = ContentValues().apply {
                 put(MediaStore.Video.Media.DISPLAY_NAME, name); put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
                 put(MediaStore.Video.Media.RELATIVE_PATH, "DCIM/時間相機")
+                put(MediaStore.Video.Media.DATE_TAKEN, System.currentTimeMillis())
             }
             vc.output.prepareRecording(this, MediaStoreOutputOptions.Builder(contentResolver, MediaStore.Video.Media.EXTERNAL_CONTENT_URI).setContentValues(v).setLocation(Geo.loc).build())
         } else vc.output.prepareRecording(this, FileOutputOptions.Builder(File(legacyDir, name)).setLocation(Geo.loc).build())
@@ -466,7 +497,9 @@ class MainActivity : AppCompatActivity() {
                     if (ev.hasError() && ev.error != VideoRecordEvent.Finalize.ERROR_SOURCE_INACTIVE) toast("錄影失敗（${ev.error}）")
                     else { toast("已儲存 $name")
                         if (Build.VERSION.SDK_INT < 29) MediaScannerConnection.scanFile(this, arrayOf(File(legacyDir, name).path), arrayOf("video/mp4")) { _, u -> if (u != null) onSaved(u, "video/mp4", name) }
-                        else onSaved(ev.outputResults.outputUri, "video/mp4", name) }
+                        else { val u = ev.outputResults.outputUri
+                            runCatching { contentResolver.update(u, ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }, null, null) }
+                            onSaved(u, "video/mp4", name); rescan(u, "video/mp4") } }
                 }
             }
         }
