@@ -3,6 +3,7 @@ package tw.timecam
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.ContentValues
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.*
 import android.media.MediaScannerConnection
@@ -18,6 +19,11 @@ import android.widget.*
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.launch
+import tw.timecam.upload.UploadPrefs
+import tw.timecam.upload.UploadRepo
+import tw.timecam.upload.UploadScheduler
 import androidx.camera.core.*
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
@@ -62,6 +68,8 @@ class MainActivity : AppCompatActivity() {
     private var lm: LocationManager? = null
     private var lastGeoLoc: Location? = null
     private var lastGeoAt = 0L
+    private var lastMediaUri: Uri? = null
+    private var lastMediaMime: String = "image/jpeg"
     private val locListener = LocationListener { onLoc(it) }
     private val effectThread = HandlerThread("overlay").apply { start() }
     private val overlay by lazy {
@@ -96,7 +104,7 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
         previewView = findViewById(R.id.preview); wm = findViewById(R.id.wm); shutter = findViewById(R.id.shutter)
         previewView.scaleType = PreviewView.ScaleType.FIT_CENTER
-        previewView.setBackgroundColor(Color.WHITE)
+        previewView.setBackgroundColor(0xFF1C1C1C.toInt())
         previewView.implementationMode = PreviewView.ImplementationMode.PERFORMANCE
         val top = findViewById<View>(R.id.top); val ctrl = findViewById<View>(R.id.ctrl)
         // 工具列避開狀態列／瀏海，控制列避開導覽列（三鍵或手勢）
@@ -104,22 +112,33 @@ class MainActivity : AppCompatActivity() {
         EdgeInsets.pad(ctrl, top = false) { ctrl.post { updateFrame() } }
         ctrl.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> ctrl.post { updateFrame() } }
         top.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> top.post { updateFrame() } }
-        refreshSite()
         findViewById<View>(R.id.mPhoto).setOnClickListener { setMode(false) }
         findViewById<View>(R.id.mVideo).setOnClickListener { setMode(true) }
         setMode(false, rebind = false)
         shutter.setOnClickListener { if (videoMode) toggleRec() else takePhoto() }
-        findViewById<View>(R.id.settings).setOnClickListener { openSheet() }
-        findViewById<View>(R.id.pick).setOnClickListener { picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) }
-        findViewById<TextView>(R.id.btnFlash).setOnClickListener { cycleFlash() }
-        findViewById<TextView>(R.id.btnTorch).setOnClickListener { camera?.cameraControl?.enableTorch(!torchOn) }
-        findViewById<TextView>(R.id.btnLens).setOnClickListener {
+        findViewById<View>(R.id.settings).setOnClickListener { openTemplates() }
+        findViewById<View>(R.id.btnEdit).setOnClickListener { openSheet() }
+        findViewById<View>(R.id.btnWmEntry).setOnClickListener { openSheet() }
+        findViewById<View>(R.id.btnPin).setOnClickListener { openSheet() }
+        findViewById<View>(R.id.pick).setOnClickListener { openLastPhoto() }
+        findViewById<View>(R.id.btnFlash).setOnClickListener { cycleFlash() }
+        findViewById<View>(R.id.btnLens).setOnClickListener {
             if (recording != null) return@setOnClickListener
             lensFacing = if (lensFacing == CameraSelector.LENS_FACING_BACK) CameraSelector.LENS_FACING_FRONT else CameraSelector.LENS_FACING_BACK
             extMode = ExtensionMode.NONE; bind()
         }
-        findViewById<TextView>(R.id.btnExt).setOnClickListener { cycleExt() }
-        setupGestures(); setupSliders()
+        findViewById<View>(R.id.btnMenu).setOnClickListener { showDrawer(true) }
+        findViewById<View>(R.id.scrim).setOnClickListener { showDrawer(false) }
+        findViewById<View>(R.id.dSettings).setOnClickListener { showDrawer(false); startActivity(Intent(this, SettingsActivity::class.java)) }
+        findViewById<View>(R.id.dTorch).setOnClickListener { camera?.cameraControl?.enableTorch(!torchOn) }
+        findViewById<View>(R.id.dExt).setOnClickListener { cycleExt() }
+        findViewById<View>(R.id.dStamp).setOnClickListener {
+            showDrawer(false)
+            picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+        }
+        val stage = findViewById<View>(R.id.stage)
+        stage.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> stage.post { updateFrame() } }
+        setupGestures(); setupSliders(); loadLastThumb()
         object : OrientationEventListener(this) {
             override fun onOrientationChanged(o: Int) {
                 if (o == ORIENTATION_UNKNOWN) return
@@ -135,7 +154,7 @@ class MainActivity : AppCompatActivity() {
     private fun has(p: String) = ContextCompat.checkSelfPermission(this, p) == PackageManager.PERMISSION_GRANTED
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
     private fun toast(s: String) = runOnUiThread { Toast.makeText(this, s, Toast.LENGTH_SHORT).show() }
-    private fun refreshSite() { findViewById<TextView>(R.id.siteChip).text = "●  " + wm.data.site.ifBlank { "時間相機" } }
+    private fun refreshSite() { /* 社宅名稱改在浮水印／編輯頁顯示 */ }
 
     private fun startCamera() {
         val f = ProcessCameraProvider.getInstance(this)
@@ -193,21 +212,21 @@ class MainActivity : AppCompatActivity() {
 
     /** 預覽區域：上方工具列與下方控制列之間；浮水印放在實際影像框內 */
     private fun updateFrame() {
-        val root = findViewById<View>(R.id.root); val top = findViewById<View>(R.id.top); val ctrl = findViewById<View>(R.id.ctrl)
-        if (root.height == 0) return
+        val stage = findViewById<View>(R.id.stage)
+        if (stage.width == 0 || stage.height == 0) return
+        val r = ImageMath.fit(stage.width.toFloat(), stage.height.toFloat(), aspect())
         val lp = previewView.layoutParams as FrameLayout.LayoutParams
-        val tm = top.bottom; val bm = root.height - ctrl.top
-        if (lp.topMargin != tm || lp.bottomMargin != bm) { lp.topMargin = tm; lp.bottomMargin = bm; previewView.layoutParams = lp }
-        val r = ImageMath.fit(root.width.toFloat(), (root.height - tm - bm).toFloat(), aspect())
-        wm.imageRect = RectF(r[0], tm + r[1], r[0] + r[2], tm + r[1] + r[3]); wm.invalidate()
+        val w = r[2].toInt(); val h = r[3].toInt(); val l = r[0].toInt(); val t = r[1].toInt()
+        if (lp.width != w || lp.height != h || lp.leftMargin != l || lp.topMargin != t) {
+            lp.width = w; lp.height = h; lp.leftMargin = l; lp.topMargin = t; lp.gravity = Gravity.NO_GRAVITY
+            previewView.layoutParams = lp
+        }
+        wm.imageRect = RectF(r[0], r[1], r[0] + r[2], r[1] + r[3]); wm.invalidate()
     }
 
     private fun observeCamera() {
         val cam = camera ?: return
-        cam.cameraInfo.zoomState.observe(this) { z ->
-            findViewById<TextView>(R.id.zoomLbl).text = String.format("%.1fx", z.zoomRatio)
-            findViewById<SeekBar>(R.id.zoom).progress = (z.linearZoom * 100).toInt()
-        }
+        cam.cameraInfo.zoomState.observe(this) { z -> renderZoom(z.minZoomRatio, z.maxZoomRatio, z.zoomRatio) }
         cam.cameraInfo.torchState.observe(this) { torchOn = it == TorchState.ON; updateChips() }
         val es = cam.cameraInfo.exposureState; val ev = findViewById<SeekBar>(R.id.ev)
         findViewById<View>(R.id.evRow).visibility = if (es.isExposureCompensationSupported) View.VISIBLE else View.GONE
@@ -223,10 +242,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupSliders() {
-        findViewById<SeekBar>(R.id.zoom).setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(s: SeekBar, p: Int, user: Boolean) { if (user) camera?.cameraControl?.setLinearZoom(p / 100f) }
-            override fun onStartTrackingTouch(s: SeekBar) {}; override fun onStopTrackingTouch(s: SeekBar) {}
-        })
         findViewById<SeekBar>(R.id.ev).setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(s: SeekBar, p: Int, user: Boolean) {
                 val cam = camera ?: return; if (!user) return
@@ -255,8 +270,12 @@ class MainActivity : AppCompatActivity() {
                 cam.cameraControl.setExposureCompensationIndex(0); findViewById<SeekBar>(R.id.ev).let { s -> cam.cameraInfo.exposureState.let { s.progress = -it.exposureCompensationRange.lower } }
                 updateEvLabel()
                 val f = findViewById<View>(R.id.focus)
-                f.x = e.x - f.width / 2; f.y = e.y - f.height / 2; f.scaleX = 1.4f; f.scaleY = 1.4f; f.alpha = 1f
+                f.x = previewView.left + e.x - f.width / 2; f.y = previewView.top + e.y - f.height / 2
+                f.scaleX = 1.4f; f.scaleY = 1.4f; f.alpha = 1f
                 f.animate().scaleX(1f).scaleY(1f).setDuration(200).withEndAction { f.animate().alpha(0f).setStartDelay(900).setDuration(300) }
+                val evRow = findViewById<View>(R.id.evRow)
+                evRow.visibility = View.VISIBLE
+                evRow.animate().setStartDelay(2500).withEndAction { evRow.visibility = View.GONE }.start()
                 return true
             }
         })
@@ -267,7 +286,8 @@ class MainActivity : AppCompatActivity() {
         if (recording != null) return
         videoMode = video; shutter.video = video
         val on = findViewById<TextView>(if (video) R.id.mVideo else R.id.mPhoto); val off = findViewById<TextView>(if (video) R.id.mPhoto else R.id.mVideo)
-        on.setBackgroundResource(R.drawable.seg_on); on.setTextColor(Watermark.AC); off.background = null; off.setTextColor(0xB3FFFFFF.toInt())
+        on.setTextColor(0xFF111111.toInt()); off.setTextColor(0xFF9A9A9A.toInt())
+        on.paint.isUnderlineText = false; paintModeDot(on, true); paintModeDot(off, false)
         if (video) extMode = ExtensionMode.NONE
         if (rebind) bind()
     }
@@ -284,18 +304,20 @@ class MainActivity : AppCompatActivity() {
     }
     private fun updateChips() {
         val hasFlash = camera?.cameraInfo?.hasFlashUnit() == true
-        findViewById<TextView>(R.id.btnFlash).apply {
-            visibility = if (hasFlash && !videoMode) View.VISIBLE else View.GONE
-            text = when (flashMode) { ImageCapture.FLASH_MODE_ON -> "⚡ 開"; ImageCapture.FLASH_MODE_OFF -> "⚡ 關"; else -> "⚡ 自動" }
+        findViewById<ImageButton>(R.id.btnFlash).apply {
+            visibility = if (hasFlash && !videoMode) View.VISIBLE else View.INVISIBLE
+            setImageResource(when (flashMode) {
+                ImageCapture.FLASH_MODE_ON -> R.drawable.ic_flash
+                ImageCapture.FLASH_MODE_OFF -> R.drawable.ic_flash_off
+                else -> R.drawable.ic_flash_auto
+            })
+            contentDescription = "閃光燈：" + when (flashMode) { ImageCapture.FLASH_MODE_ON -> "開"; ImageCapture.FLASH_MODE_OFF -> "關"; else -> "自動" }
         }
-        findViewById<TextView>(R.id.btnTorch).apply {
-            visibility = if (hasFlash) View.VISIBLE else View.GONE
-            text = if (torchOn) "🔦 開" else "🔦 關"; setTextColor(if (torchOn) Watermark.AC else Color.WHITE)
+        findViewById<TextView>(R.id.dTorch).apply {
+            isEnabled = hasFlash
+            text = "手電筒　　" + if (torchOn) "開" else "關"
         }
-        findViewById<TextView>(R.id.btnExt).apply {
-            visibility = if (videoMode) View.GONE else View.VISIBLE
-            text = extName(extMode); setTextColor(if (extMode != ExtensionMode.NONE) Watermark.AC else Color.WHITE)
-        }
+        findViewById<TextView>(R.id.dExt).text = "影像模式　　" + extName(extMode)
     }
 
     // ---------- 照片 ----------
@@ -391,7 +413,7 @@ class MainActivity : AppCompatActivity() {
             for (tag in EXIF_TAGS) a.getAttribute(tag)?.let { b.setAttribute(tag, it) }
             b.setAttribute(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL.toString())
             b.setAttribute(ExifInterface.TAG_PIXEL_X_DIMENSION, w.toString()); b.setAttribute(ExifInterface.TAG_PIXEL_Y_DIMENSION, h.toString())
-            b.setAttribute(ExifInterface.TAG_SOFTWARE, "時間相機 1.1.5")
+            b.setAttribute(ExifInterface.TAG_SOFTWARE, "時間相機 1.2.0")
             b.saveAttributes()
         }
     }
@@ -447,10 +469,11 @@ class MainActivity : AppCompatActivity() {
             } catch (e: Throwable) { runCatching { contentResolver.delete(uri, null, null) }; throw e }
             tmp.delete()
             rescan(uri, "image/jpeg")
+            rememberMedia(uri, "image/jpeg", name)
         } else {
             val f = File(legacyDir, name); tmp.copyTo(f, overwrite = true); tmp.delete()
             f.setLastModified(takenMs)
-            MediaScannerConnection.scanFile(this, arrayOf(f.path), arrayOf("image/jpeg"), null)
+            MediaScannerConnection.scanFile(this, arrayOf(f.path), arrayOf("image/jpeg")) { _, u -> if (u != null) rememberMedia(u, "image/jpeg", name) }
         }
     }
 
@@ -479,20 +502,20 @@ class MainActivity : AppCompatActivity() {
             vc.output.prepareRecording(this, MediaStoreOutputOptions.Builder(contentResolver, MediaStore.Video.Media.EXTERNAL_CONTENT_URI).setContentValues(v).setLocation(Geo.loc).build())
         } else vc.output.prepareRecording(this, FileOutputOptions.Builder(File(legacyDir, name)).setLocation(Geo.loc).build())
         if (has(Manifest.permission.RECORD_AUDIO)) pending.withAudioEnabled() else toast("未取得麥克風權限，將錄製無聲影片")
-        val recLbl = findViewById<TextView>(R.id.rec)
+        val recLbl = findViewById<View>(R.id.rec)
         recData = WmData.load(this)  // 錄影期間地址固定
         recording = pending.start(ContextCompat.getMainExecutor(this)) { ev ->
             when (ev) {
-                is VideoRecordEvent.Start -> { shutter.recording = true; recLbl.visibility = View.VISIBLE; recLbl.text = "●  00:00" }
-                is VideoRecordEvent.Status -> { val s = TimeUnit.NANOSECONDS.toSeconds(ev.recordingStats.recordedDurationNanos); recLbl.text = String.format("●  %02d:%02d", s / 60, s % 60) }
+                is VideoRecordEvent.Start -> { shutter.recording = true; recLbl.visibility = View.VISIBLE; findViewById<TextView>(R.id.recTime).text = "00:00" }
+                is VideoRecordEvent.Status -> { val s = TimeUnit.NANOSECONDS.toSeconds(ev.recordingStats.recordedDurationNanos); findViewById<TextView>(R.id.recTime).text = String.format("%02d:%02d", s / 60, s % 60) }
                 is VideoRecordEvent.Finalize -> {
                     shutter.recording = false; recLbl.visibility = View.GONE; recording = null; recData = null
                     if (ev.hasError() && ev.error != VideoRecordEvent.Finalize.ERROR_SOURCE_INACTIVE) toast("錄影失敗（${ev.error}）")
                     else { toast("已儲存到相簿")
-                        if (Build.VERSION.SDK_INT < 29) MediaScannerConnection.scanFile(this, arrayOf(File(legacyDir, name).path), arrayOf("video/mp4"), null)
+                        if (Build.VERSION.SDK_INT < 29) MediaScannerConnection.scanFile(this, arrayOf(File(legacyDir, name).path), arrayOf("video/mp4")) { _, u -> if (u != null) rememberMedia(u, "video/mp4", name) }
                         else { val u = ev.outputResults.outputUri
                             runCatching { contentResolver.update(u, ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }, null, null) }
-                            rescan(u, "video/mp4") } }
+                            rescan(u, "video/mp4"); rememberMedia(u, "video/mp4", name) } }
                 }
             }
         }
@@ -518,6 +541,8 @@ class MainActivity : AppCompatActivity() {
             setOnCheckedChangeListener { _, b -> pr.edit().putBoolean("showAddr", b).apply(); wm.reload(); renderTpls() } }
         v.findViewById<androidx.appcompat.widget.SwitchCompat>(R.id.swGeo).apply { isChecked = pr.getBoolean("showGeo", true)
             setOnCheckedChangeListener { _, b -> pr.edit().putBoolean("showGeo", b).apply(); wm.reload(); renderTpls() } }
+        v.findViewById<androidx.appcompat.widget.SwitchCompat>(R.id.swExtra).apply { isChecked = pr.getBoolean("showExtra", false)
+            setOnCheckedChangeListener { _, b -> pr.edit().putBoolean("showExtra", b).apply(); wm.reload(); renderTpls() } }
         v.findViewById<View>(R.id.refreshLoc).setOnClickListener { refreshLocation() }
         segRow(v.findViewById(R.id.posRow), WmData.POS, "pos", 0); segRow(v.findViewById(R.id.sizeRow), WmData.SIZES, "size", 1)
         renderTpls(); updateGeoStatus()
@@ -537,7 +562,7 @@ class MainActivity : AppCompatActivity() {
             row.addView(tv, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(28)))
             tv.setOnClickListener { pr.edit().putInt(key, i).apply(); wm.reload(); segRow(row, items, key, def) }
             val on = pr.getInt(key, def) == i
-            tv.setTextColor(if (on) Watermark.AC else 0xB3FFFFFF.toInt()); if (on) tv.setBackgroundResource(R.drawable.seg_on)
+            tv.setTextColor(if (on) Color.WHITE else 0xFF111111.toInt()); tv.setBackgroundResource(if (on) R.drawable.done_dark else 0)
         }
     }
 
@@ -609,7 +634,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun cleanAddr(s: String) = s.trim().replace(Regex("^\\d{3,6}"), "").replace(Regex("^(台灣|臺灣)"), "").replace(Regex("^\\d{3,6}"), "").trim()
+    private fun cleanAddr(s: String) = Geo.cleanAddr(s)
 
     private fun updateGeoStatus() {
         val tv = sheetView?.findViewById<TextView>(R.id.geoStatus) ?: return
@@ -617,8 +642,160 @@ class MainActivity : AppCompatActivity() {
         tv.text = if (l == null) Geo.status else "自動：" + Geo.addr.ifBlank { Geo.addrStatus.ifBlank { "地址查詢中…" } } + "\n" + Geo.coords(l)
     }
 
-    override fun onResume() { super.onResume(); if (hasLoc()) startLocation() }
+    override fun onResume() { super.onResume(); if (hasLoc()) startLocation(); loadLastThumb() }
     override fun onPause() { lm?.removeUpdates(locListener); super.onPause() }
+
+
+    private fun paintModeDot(tv: TextView, on: Boolean) {
+        if (on) {
+            val d = android.graphics.drawable.GradientDrawable().apply { shape = android.graphics.drawable.GradientDrawable.OVAL; setColor(0xFF111111.toInt()); setSize(dp(5), dp(5)) }
+            tv.setCompoundDrawablesWithIntrinsicBounds(null, null, null, d)
+            tv.compoundDrawablePadding = dp(3)
+        } else {
+            tv.setCompoundDrawablesWithIntrinsicBounds(null, null, null, null)
+        }
+    }
+
+    private fun renderZoom(min: Float, max: Float, ratio: Float) {
+        val stack = findViewById<LinearLayout>(R.id.zoomStack)
+        val stops = listOf(0.5f, 1f, 2f, 10f).filter { it >= min - 0.06f && it <= max + 0.05f }.ifEmpty { listOf(1f) }
+        if (stack.tag != stops) {
+            stack.removeAllViews(); stack.tag = stops
+            stops.forEach { z ->
+                val b = TextView(this).apply {
+                    gravity = Gravity.CENTER; setTypeface(typeface, Typeface.BOLD); tag = z
+                    setOnClickListener { camera?.cameraControl?.setZoomRatio(z) }
+                }
+                stack.addView(b)
+            }
+        }
+        val closest = stops.minBy { kotlin.math.abs(it - ratio) }
+        for (i in 0 until stack.childCount) {
+            val b = stack.getChildAt(i) as TextView
+            val z = b.tag as Float
+            val sel = z == closest
+            val size = if (sel) dp(40) else dp(34)
+            b.layoutParams = LinearLayout.LayoutParams(size, size).apply { bottomMargin = dp(8) }
+            b.background = ContextCompat.getDrawable(this, if (sel) R.drawable.zoom_on else R.drawable.zoom_off)
+            b.setTextColor(if (sel) 0xFF111111.toInt() else Color.WHITE)
+            b.textSize = if (sel) 12f else 10f
+            b.text = when { z == 1f -> "1×"; z < 1f -> "0.5"; z == z.toInt().toFloat() -> z.toInt().toString(); else -> String.format("%.1f", z) }
+        }
+    }
+
+    private fun showDrawer(show: Boolean) {
+        findViewById<View>(R.id.scrim).visibility = if (show) View.VISIBLE else View.GONE
+        findViewById<View>(R.id.drawer).visibility = if (show) View.VISIBLE else View.GONE
+        if (show) updateChips()
+    }
+
+    @Deprecated("deprecated in Android")
+    override fun onBackPressed() {
+        if (findViewById<View>(R.id.drawer).visibility == View.VISIBLE) { showDrawer(false); return }
+        @Suppress("DEPRECATION") super.onBackPressed()
+    }
+
+    private fun rememberMedia(uri: Uri, mime: String, name: String) {
+        lastMediaUri = uri; lastMediaMime = mime
+        WmData.prefs(this).edit().putString("lastUri", uri.toString()).putString("lastMime", mime).apply()
+        runOnUiThread {
+            bindThumb(uri)
+            lifecycleScope.launch {
+                runCatching { UploadRepo(this@MainActivity).enqueue(uri, mime, name) }
+                    .onFailure { android.util.Log.w("TimeCam", "queue upload: ${it.message}") }
+                UploadScheduler.afterCapture(this@MainActivity)
+            }
+        }
+    }
+
+    private fun loadLastThumb() {
+        val pr = WmData.prefs(this)
+        lastMediaUri = pr.getString("lastUri", null)?.let { Uri.parse(it) }
+        lastMediaMime = pr.getString("lastMime", "image/jpeg") ?: "image/jpeg"
+        bindThumb(lastMediaUri)
+    }
+
+    private fun bindThumb(uri: Uri?) {
+        val iv = findViewById<ImageView>(R.id.lastThumb)
+        if (uri == null) { iv.setImageDrawable(null); return }
+        try {
+            if (lastMediaMime.startsWith("video")) {
+                val m = android.media.MediaMetadataRetriever()
+                runCatching {
+                    m.setDataSource(this, uri)
+                    iv.setImageBitmap(m.frameAtTime)
+                }
+                m.release()
+            } else {
+                val bo = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bo) }
+                val sample = ImageMath.sampleFor(bo.outWidth, bo.outHeight, 200_000)
+                val opts = BitmapFactory.Options().apply { inSampleSize = sample }
+                contentResolver.openInputStream(uri)?.use { iv.setImageBitmap(BitmapFactory.decodeStream(it, null, opts)) }
+            }
+        } catch (_: Exception) { }
+    }
+
+    private fun openLastPhoto() {
+        val uri = lastMediaUri ?: WmData.prefs(this).getString("lastUri", null)?.let { Uri.parse(it) }
+        if (uri == null) { toast("還沒有拍攝紀錄，拍一張就會出現在這裡"); return }
+        try {
+            startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uri, lastMediaMime).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK))
+        } catch (e: Exception) { toast("打不開相簿：${e.message}") }
+    }
+
+    private fun openTemplates() {
+        val dlg = BottomSheetDialog(this, R.style.SheetTheme)
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL; setBackgroundResource(R.drawable.sheet_light)
+            setPadding(dp(18), dp(8), dp(18), dp(24))
+        }
+        box.addView(View(this).apply {
+            background = ContextCompat.getDrawable(this@MainActivity, R.drawable.grab_light)
+            layoutParams = LinearLayout.LayoutParams(dp(40), dp(4)).apply { gravity = Gravity.CENTER_HORIZONTAL; bottomMargin = dp(10) }
+        })
+        val hd = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL; layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(10) } }
+        hd.addView(TextView(this).apply { text = "浮水印範本"; textSize = 17f; setTypeface(typeface, Typeface.BOLD); setTextColor(0xFF111111.toInt()); layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f) })
+        val done = TextView(this).apply {
+            text = "完成"; setTextColor(Color.WHITE); textSize = 13f; setTypeface(typeface, Typeface.BOLD)
+            gravity = Gravity.CENTER; setBackgroundResource(R.drawable.done_dark)
+            setPadding(dp(16), dp(8), dp(16), dp(8)); setOnClickListener { dlg.dismiss() }
+        }
+        hd.addView(done); box.addView(hd)
+        box.addView(TextView(this).apply { text = "選一種樣式，會同時出現在預覽與存檔的照片、影片上。"; textSize = 12f; setTextColor(0xFF888888.toInt()); setPadding(0, 0, 0, dp(10)) })
+        val grid = android.widget.GridLayout(this).apply { columnCount = 2 }
+        val pr = WmData.prefs(this)
+        fun paint() {
+            grid.removeAllViews()
+            val d = WmData.load(this)
+            WmData.TEMPLATES.forEachIndexed { i, name ->
+                val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(4), dp(4), dp(4), dp(8)) }
+                val img = ImageView(this).apply {
+                    setImageBitmap(Watermark.thumbnail(d, i, 480, 360)); scaleType = ImageView.ScaleType.CENTER_CROP
+                    val sel = pr.getInt("tpl", 5) == i
+                    background = android.graphics.drawable.GradientDrawable().apply {
+                        cornerRadius = dp(10).toFloat(); setStroke(dp(if (sel) 3 else 1), if (sel) 0xFF111111.toInt() else 0xFFECECEC.toInt()); setColor(0xFFF7F7F7.toInt())
+                    }
+                    setPadding(dp(3), dp(3), dp(3), dp(3)); clipToOutline = true
+                }
+                col.addView(img, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(110)))
+                col.addView(TextView(this).apply { text = name; textSize = 13f; setTypeface(typeface, Typeface.BOLD); setTextColor(0xFF111111.toInt()); setPadding(dp(4), dp(6), 0, 0) })
+                col.setOnClickListener { pr.edit().putInt("tpl", i).apply(); wm.reload(); paint() }
+                val lp = android.widget.GridLayout.LayoutParams().apply {
+                    width = 0; height = android.widget.GridLayout.LayoutParams.WRAP_CONTENT
+                    columnSpec = android.widget.GridLayout.spec(android.widget.GridLayout.UNDEFINED, 1f)
+                    setMargins(dp(4), dp(4), dp(4), dp(4))
+                }
+                grid.addView(col, lp)
+            }
+        }
+        paint(); box.addView(grid)
+        dlg.setContentView(box)
+        EdgeInsets.pad(box, top = false)
+        dlg.behavior.state = com.google.android.material.bottomsheet.BottomSheetBehavior.STATE_EXPANDED
+        dlg.behavior.skipCollapsed = true
+        dlg.show()
+    }
 
     override fun onDestroy() { recording?.stop(); effectThread.quitSafely(); bg.shutdown(); super.onDestroy() }
 }

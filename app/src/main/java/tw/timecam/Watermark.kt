@@ -16,19 +16,26 @@ object Geo {
     @Volatile var addrStatus = ""
     @Volatile var loc: Location? = null
     fun coords(l: Location) = String.format(Locale.US, "%.5f, %.5f (±%dm)", l.latitude, l.longitude, l.accuracy.toInt())
+    /** 去掉「台灣」前綴，保留郵遞區號（例如 235新北市…） */
+    fun cleanAddr(s: String) = s.trim().replace(Regex("""^(台灣|臺灣)\s*"""), "").trim()
 }
 
 data class WmData(
     val site: String, val case_: String, val bld: String, val flr: String, val note: String,
     val addr: String = "", val geo: String = "", val tpl: Int = 0, val pos: Int = 0, val size: Int = 1,
+    val showExtra: Boolean = false,
 ) {
     companion object {
-        val TEMPLATES = listOf("標準卡片", "工程紀錄", "簡約", "大時間", "藍色商務")
+        val TEMPLATES = listOf("標準卡片", "工程紀錄", "簡約", "大時間", "藍色商務", "時間地址")
         val POS = listOf("左下", "右下", "左上", "右上")
         val SIZES = listOf("小", "中", "大")
         fun prefs(c: Context) = c.getSharedPreferences("wm", Context.MODE_PRIVATE)
         fun load(c: Context): WmData {
             val p = prefs(c)
+            if (!p.getBoolean("ui_v120", false)) {
+                // 1.2.0 改版：預設改用「時間地址」樣式（可在範本改回）
+                p.edit().putBoolean("ui_v120", true).putInt("tpl", 5).apply()
+            }
             val manual = p.getString("addr", "")!!.trim()
             val l = Geo.loc
             val addr = if (!p.getBoolean("showAddr", true)) "" else manual.ifBlank {
@@ -37,7 +44,8 @@ data class WmData(
             val geo = if (!p.getBoolean("showGeo", true)) "" else l?.let { Geo.coords(it) } ?: Geo.status
             return WmData(p.getString("site", "中和安邦社宅")!!, p.getString("case", "")!!, p.getString("bld", "")!!,
                 p.getString("flr", "")!!, p.getString("note", "")!!, addr, geo,
-                p.getInt("tpl", 0), p.getInt("pos", 0), p.getInt("size", 1))
+                p.getInt("tpl", 5), p.getInt("pos", 0), p.getInt("size", 1),
+                p.getBoolean("showExtra", false))
         }
         fun save(c: Context, key: String, v: String) = prefs(c).edit().putString(key, v).apply()
     }
@@ -100,7 +108,7 @@ object Watermark {
     fun render(c: Canvas, d: WmData, t: ZonedDateTime, base: Float, area: RectF, margin: Float) {
         val u = base * floatArrayOf(0.8f, 1f, 1.3f)[d.size.coerceIn(0, 2)]
         val maxW = area.width() - margin * 2
-        val tpl = d.tpl.coerceIn(0, 4)
+        val tpl = d.tpl.coerceIn(0, 5)
         val s = draw(tpl, null, d, t, u, maxW)
         val x = if (d.pos == 1 || d.pos == 3) area.right - margin - s.x else area.left + margin
         val y = if (d.pos >= 2) area.top + margin else area.bottom - margin - s.y
@@ -108,8 +116,12 @@ object Watermark {
     }
 
     private fun draw(tpl: Int, c: Canvas?, d: WmData, t: ZonedDateTime, u: Float, maxW: Float): PointF = when (tpl) {
-        1 -> board(c, d, t, u, maxW); 2 -> minimal(c, d, t, u, maxW); 3 -> bigTime(c, d, t, u, maxW); 4 -> blue(c, d, t, u, maxW)
+        1 -> board(c, d, t, u, maxW); 2 -> minimal(c, d, t, u, maxW); 3 -> bigTime(c, d, t, u, maxW); 4 -> blue(c, d, t, u, maxW); 5 -> timeAddr(c, d, t, u, maxW)
         else -> card(c, d, t, u, maxW)
+    }
+    fun extraLine(d: WmData): String {
+        if (!d.showExtra) return ""
+        return listOf(d.site.trim(), d.case_.trim(), listOf(d.bld.trim(), d.flr.trim()).filter { it.isNotEmpty() }.joinToString(" "), d.note.trim()).filter { it.isNotEmpty() }.joinToString(" · ")
     }
 
     // 0 標準卡片
@@ -269,7 +281,39 @@ object Watermark {
         return PointF(W, H)
     }
 
+    // 5 時間地址（1.2.0 預設：大時間 + 黃線 + 日期星期 + 地址）
+    private fun timeAddr(c: Canvas?, d: WmData, t: ZonedDateTime, u: Float, maxW: Float): PointF {
+        val yellow = 0xFFFFD02A.toInt()
+        val pT = shadow(p(T800, 4.8f * u, Color.WHITE), u)
+        val pD = shadow(p(T700, 1.05f * u, Color.WHITE), u)
+        val pA = shadow(p(T600, 0.95f * u, Color.WHITE), u)
+        val pE = shadow(p(T600, 0.88f * u, Color.WHITE), u)
+        val hmS = hm(t); val tW = pT.measureText(hmS); val gap = u * .7f; val bar = u * .22f
+        val date = t.format(DateTimeFormatter.ofPattern("yyyy年MM月dd日"))
+        val wk = "星期" + WD[t.dayOfWeek.value - 1]
+        val rightW = maxOf(pD.measureText(date), pD.measureText(wk))
+        val topW = tW + gap + bar + gap + rightW
+        val addr = d.addr.trim()
+        val addrMax = maxOf(u * 8f, minOf(maxW, maxOf(topW, maxW * 0.92f)))
+        val addrLines = if (addr.isEmpty()) emptyList() else wrap(pA, addr, addrMax).take(2)
+        val extraLines = extraLine(d).let { if (it.isEmpty()) emptyList() else wrap(pE, it, addrMax).take(2) }
+        val below = (if (addrLines.isEmpty()) 0f else u * .45f + addrLines.size * u * 1.25f) +
+            (if (extraLines.isEmpty()) 0f else u * .15f + extraLines.size * u * 1.15f)
+        val W = minOf(maxW, maxOf(topW, addrLines.maxOfOrNull { pA.measureText(it) } ?: 0f, extraLines.maxOfOrNull { pE.measureText(it) } ?: 0f))
+        val H = u * 4.5f + below
+        if (c == null) return PointF(W, H)
+        c.drawText(hmS, 0f, u * 3.95f, pT)
+        val bx = tW + gap; c.drawRect(bx, u * .55f, bx + bar, u * 4.15f, fill(yellow))
+        val rx = bx + bar + gap
+        c.drawText(date, rx, u * 1.7f, pD); c.drawText(wk, rx, u * 3.15f, pD)
+        var y = u * 4.5f
+        addrLines.forEach { c.drawText(it, 0f, y + u * 0.9f, pA); y += u * 1.25f }
+        extraLines.forEach { c.drawText(it, 0f, y + u * 0.85f, pE); y += u * 1.15f }
+        return PointF(W, H)
+    }
+
     /** 樣板縮圖 */
+
     fun thumbnail(d: WmData, tpl: Int, w: Int, h: Int, t: ZonedDateTime = Names.now()): Bitmap {
         val b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888); val c = Canvas(b)
         c.drawPaint(Paint().apply { shader = LinearGradient(0f, 0f, 0f, h.toFloat(), 0xFF7A8FA3.toInt(), 0xFF3C4650.toInt(), Shader.TileMode.CLAMP) })
