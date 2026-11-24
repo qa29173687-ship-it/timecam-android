@@ -6,6 +6,8 @@ import android.content.ContentValues
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.*
+import android.media.AudioManager
+import android.media.MediaActionSound
 import android.media.MediaScannerConnection
 import android.location.*
 import java.util.Locale
@@ -45,12 +47,16 @@ import java.io.File
 import java.io.OutputStream
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 class MainActivity : AppCompatActivity() {
     private lateinit var previewView: PreviewView
     private lateinit var wm: WatermarkView
     private lateinit var shutter: ShutterView
     private val bg = Executors.newSingleThreadExecutor()
+    private val capturing = AtomicBoolean(false)
+    private var shutterSound: MediaActionSound? = null
+    private var thumbGen = 0
     private var provider: ProcessCameraProvider? = null
     private var extMgr: ExtensionsManager? = null
     private var camera: androidx.camera.core.Camera? = null
@@ -103,6 +109,7 @@ class MainActivity : AppCompatActivity() {
         WindowCompat.getInsetsController(window, window.decorView).apply { isAppearanceLightStatusBars = true; isAppearanceLightNavigationBars = true }
         setContentView(R.layout.activity_main)
         previewView = findViewById(R.id.preview); wm = findViewById(R.id.wm); shutter = findViewById(R.id.shutter)
+        shutterSound = MediaActionSound().also { runCatching { it.load(MediaActionSound.SHUTTER_CLICK) } }
         previewView.scaleType = PreviewView.ScaleType.FIT_CENTER
         previewView.setBackgroundColor(0xFF1C1C1C.toInt())
         previewView.implementationMode = PreviewView.ImplementationMode.PERFORMANCE
@@ -179,12 +186,14 @@ class MainActivity : AppCompatActivity() {
         val prevSize = if (videoMode) Size(1920, 1080) else Size(1920, 1440)
         val prs = ResolutionSelector.Builder().setAspectRatioStrategy(ratio)
             .setResolutionStrategy(ResolutionStrategy(prevSize, ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER)).build()
-        val rs = ResolutionSelector.Builder().setAspectRatioStrategy(ratio).setResolutionStrategy(ResolutionStrategy.HIGHEST_AVAILABLE_STRATEGY).build()
+        val stillSize = Size(ImageMath.MAX_STILL_LONG_EDGE, ImageMath.MAX_STILL_LONG_EDGE * 3 / 4) // 4000x3000 ≈ 12MP
+        val rs = ResolutionSelector.Builder().setAspectRatioStrategy(ratio)
+            .setResolutionStrategy(ResolutionStrategy(stillSize, ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER)).build()
         val preview = Preview.Builder().setResolutionSelector(prs).build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
         try {
             if (!videoMode) {
-                val ic = ImageCapture.Builder().setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY).setFlashMode(flashMode)
-                    .setResolutionSelector(rs).setJpegQuality(100).setTargetRotation(rotation).build()
+                val ic = ImageCapture.Builder().setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY).setFlashMode(flashMode)
+                    .setResolutionSelector(rs).setJpegQuality(95).setTargetRotation(rotation).build()
                 imageCapture = ic; videoCapture = null
                 val sel = if (extMode != ExtensionMode.NONE && extMgr != null) extMgr!!.getExtensionEnabledCameraSelector(baseSelector(), extMode) else baseSelector()
                 val g = UseCaseGroup.Builder().setViewPort(viewPort()).addUseCase(preview).addUseCase(ic).build()
@@ -321,70 +330,129 @@ class MainActivity : AppCompatActivity() {
     }
 
     // ---------- 照片 ----------
+    private fun shutterSoundOn() = WmData.prefs(this).getBoolean("shutterSound", true)
+
+    /** 按下當下就給手感：震動 + 白屏 +（可選）快門聲。對焦或存檔都不必等。 */
+    private fun shutterFeedback() {
+        val fx = findViewById<View>(R.id.flashFx)
+        fx.animate().cancel()
+        fx.alpha = 0.8f
+        fx.animate().alpha(0f).setDuration(350).start()
+        val kind = if (Build.VERSION.SDK_INT >= 30) HapticFeedbackConstants.CONFIRM else HapticFeedbackConstants.KEYBOARD_TAP
+        shutter.performHapticFeedback(kind)
+        runCatching {
+            val vib = if (Build.VERSION.SDK_INT >= 31) getSystemService(VibratorManager::class.java).defaultVibrator
+            else @Suppress("DEPRECATION") getSystemService(VIBRATOR_SERVICE) as Vibrator
+            if (vib.hasVibrator()) {
+                if (Build.VERSION.SDK_INT >= 29) {
+                    val effect = runCatching { VibrationEffect.createPredefined(VibrationEffect.EFFECT_HEAVY_CLICK) }
+                        .getOrElse { VibrationEffect.createPredefined(VibrationEffect.EFFECT_CLICK) }
+                    vib.vibrate(effect)
+                } else {
+                    @Suppress("DEPRECATION") vib.vibrate(25)
+                }
+            }
+        }
+        if (shutterSoundOn()) {
+            val mode = (getSystemService(AUDIO_SERVICE) as AudioManager).ringerMode
+            if (mode == AudioManager.RINGER_MODE_NORMAL) runCatching { shutterSound?.play(MediaActionSound.SHUTTER_CLICK) }
+        }
+    }
+
+    private fun kickAf() {
+        val cam = camera ?: return
+        if (SystemClock.elapsedRealtime() - lastTap <= 4000) return
+        val w = previewView.width; val h = previewView.height
+        if (w <= 0 || h <= 0) return
+        val pt = previewView.meteringPointFactory.createPoint(w / 2f, h / 2f)
+        runCatching {
+            cam.cameraControl.startFocusAndMetering(
+                FocusMeteringAction.Builder(pt, FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE)
+                    .setAutoCancelDuration(3, TimeUnit.SECONDS).build()
+            )
+        }
+    }
+
     private fun takePhoto() {
         val ic = imageCapture ?: return
-        val cam = camera
-        // 使用者剛點擊對焦則沿用；否則先對畫面中央對焦測光（最多等 800ms）
-        if (cam != null && SystemClock.elapsedRealtime() - lastTap > 4000) {
-            val pt = previewView.meteringPointFactory.createPoint(previewView.width / 2f, previewView.height / 2f)
-            val fut = cam.cameraControl.startFocusAndMetering(FocusMeteringAction.Builder(pt, FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE)
-                .setAutoCancelDuration(3, TimeUnit.SECONDS).build())
-            shutter.isEnabled = false
-            var fired = false
-            val go = { if (!fired) { fired = true; shutter.isEnabled = true; capture(ic) } }
-            fut.addListener({ go() }, ContextCompat.getMainExecutor(this))
-            previewView.postDelayed({ go() }, 800)
-        } else capture(ic)
+        shutterFeedback()
+        kickAf()
+        // CameraX 仍在出圖時只給回饋、不再送第二次 takePicture
+        if (!capturing.compareAndSet(false, true)) return
+        capture(ic)
     }
 
     private fun capture(ic: ImageCapture) {
-        val fx = findViewById<View>(R.id.flashFx); fx.alpha = 0.8f; fx.animate().alpha(0f).setDuration(350)
         val t = Names.now(); val d = wm.data; val loc = Geo.loc
         val src = File(cacheDir, "cap_${System.nanoTime()}.jpg")
-        ic.takePicture(ImageCapture.OutputFileOptions.Builder(src).build(), bg, object : ImageCapture.OnImageSavedCallback {
-            override fun onImageSaved(r: ImageCapture.OutputFileResults) {
-                val name = Names.base(t, d.case_) + ".jpg"
-                try { processFile(src, d, t, name, loc); toast("已儲存到相簿") }
-                catch (e: Throwable) { toast("儲存失敗：${e.message}") } finally { src.delete() }
-            }
-            override fun onError(e: ImageCaptureException) { src.delete(); toast("拍照失敗：${e.message}") }
-        })
+        try {
+            ic.takePicture(ImageCapture.OutputFileOptions.Builder(src).build(), bg, object : ImageCapture.OnImageSavedCallback {
+                override fun onImageSaved(r: ImageCapture.OutputFileResults) {
+                    capturing.set(false)
+                    val name = Names.base(t, d.case_) + ".jpg"
+                    runCatching { showThumbFromFile(src) }
+                    try { processFile(src, d, t, name, loc); toast("已儲存到相簿") }
+                    catch (e: Throwable) { toast("儲存失敗：${e.message}") } finally { src.delete() }
+                }
+                override fun onError(e: ImageCaptureException) {
+                    capturing.set(false)
+                    src.delete(); toast("拍照失敗：${e.message}")
+                }
+            })
+        } catch (e: Exception) {
+            capturing.set(false)
+            src.delete(); toast("拍照失敗：${e.message}")
+        }
     }
 
     private fun tail(f: File, n: Int = 64): ByteArray = java.io.RandomAccessFile(f, "r").use { raf ->
         val len = raf.length(); val k = minOf(n.toLong(), len).toInt(); val b = ByteArray(k); raf.seek(len - k); raf.readFully(b); b }
 
-    /** 完整解碼（必要時才降解析度）→ 依 EXIF 轉正 → 加浮水印 → 存檔並驗證 */
+    /** 解碼（必要時降到約 12MP）→ 依 EXIF 轉正 → 加浮水印 → 存檔並驗證 */
     private fun processFile(src: File, d: WmData, t: java.time.ZonedDateTime, name: String, loc: Location? = null) {
-        // 等待檔案完整（理論上 onImageSaved 時已完成，保險起見）
         var tries = 0
         while (!ImageMath.jpegComplete(tail(src)) && tries < 5) { Thread.sleep(150); tries++ }
         val o = ImageMath.orient(ExifInterface(src).getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL))
         val bo = BitmapFactory.Options().apply { inJustDecodeBounds = true }; BitmapFactory.decodeFile(src.path, bo)
         if (bo.outWidth <= 0 || bo.outHeight <= 0) error("無法讀取影像")
-        val maxPx = minOf(50_000_000L, Runtime.getRuntime().maxMemory() / 4 / 3)  // 兩張 ARGB 點陣圖需留餘裕
-        var sample = ImageMath.sampleFor(bo.outWidth, bo.outHeight, maxPx)
-        var out: Bitmap? = null
-        while (out == null) {
+        val memPx = Runtime.getRuntime().maxMemory() / 4 / 3
+        // 解碼時接近 12MP（必要時留一檔給 capSize 精準縮小），並受記憶體限制
+        var sample = ImageMath.sampleForDecode(bo.outWidth, bo.outHeight, ImageMath.MAX_STILL_PIXELS, memPx)
+        var decoded: Bitmap? = null
+        while (decoded == null) {
             var bmp: Bitmap? = null
             try {
                 bmp = BitmapFactory.decodeFile(src.path, BitmapFactory.Options().apply { inSampleSize = sample; inPreferredConfig = Bitmap.Config.ARGB_8888 })
                     ?: error("無法解碼")
                 if (!ImageMath.decodedOk(bo.outWidth, bo.outHeight, sample, bmp.width, bmp.height)) error("解碼尺寸不符（${bmp.width}x${bmp.height}）")
-                out = orientInto(bmp, o)
+                decoded = orientInto(bmp, o)
             } catch (e: OutOfMemoryError) {
                 if (sample >= 8) throw e; sample *= 2
-            } finally { if (bmp != null && bmp !== out) bmp.recycle() }
+            } finally { if (bmp != null && bmp !== decoded) bmp.recycle() }
         }
-        val (ew, eh) = ImageMath.rotatedSize(bo.outWidth / sample, bo.outHeight / sample, o.degrees)
-        if (kotlin.math.abs(out.width - ew) > 1 || kotlin.math.abs(out.height - eh) > 1) error("轉正後尺寸不符")
+        var out: Bitmap = decoded
+        if (ImageMath.needsCap(out.width, out.height)) {
+            val (nw, nh) = ImageMath.capSize(out.width, out.height)
+            val scaled = Bitmap.createScaledBitmap(out, nw, nh, true)
+            if (scaled !== out) out.recycle()
+            out = if (scaled.isMutable) scaled else {
+                val copy = scaled.copy(Bitmap.Config.ARGB_8888, true) ?: error("無法複製影像")
+                if (copy !== scaled) scaled.recycle()
+                copy
+            }
+        } else if (!out.isMutable) {
+            val copy = out.copy(Bitmap.Config.ARGB_8888, true) ?: error("無法複製影像")
+            if (copy !== out) out.recycle()
+            out = copy
+        }
         Watermark.stamp(Canvas(out), out.width.toFloat(), out.height.toFloat(), d, t)
+        showThumbFromBitmap(out)
         val tmp = File(cacheDir, "out_${System.nanoTime()}.jpg")
-        java.io.FileOutputStream(tmp).use { fo -> out.compress(Bitmap.CompressFormat.JPEG, 98, fo); fo.flush(); fo.fd.sync() }
+        java.io.FileOutputStream(tmp).use { fo -> out.compress(Bitmap.CompressFormat.JPEG, 95, fo); fo.flush(); fo.fd.sync() }
         val w = out.width; val h = out.height; out.recycle()
         if (!ImageMath.jpegComplete(tail(tmp))) error("輸出檔不完整")
-        copyExif(src, tmp, w, h); writeTime(tmp, t); writeGps(tmp, loc)
-        publishJpeg(tmp, name, t.toInstant().toEpochMilli())
+        writeMeta(src, tmp, w, h, t, loc)
+        publishJpeg(tmp, name, t.toInstant().toEpochMilli(), refreshThumb = false)
     }
 
     private fun orientInto(src: Bitmap, o: ImageMath.Orient): Bitmap {
@@ -407,29 +475,21 @@ class MainActivity : AppCompatActivity() {
         ExifInterface.TAG_LENS_MAKE, ExifInterface.TAG_LENS_MODEL, ExifInterface.TAG_DIGITAL_ZOOM_RATIO,
         ExifInterface.TAG_GPS_LATITUDE, ExifInterface.TAG_GPS_LATITUDE_REF, ExifInterface.TAG_GPS_LONGITUDE, ExifInterface.TAG_GPS_LONGITUDE_REF,
         ExifInterface.TAG_GPS_ALTITUDE, ExifInterface.TAG_GPS_ALTITUDE_REF, ExifInterface.TAG_GPS_TIMESTAMP, ExifInterface.TAG_GPS_DATESTAMP)
-    private fun copyExif(from: File, to: File, w: Int, h: Int) {
+    /** 一次寫入：複製原 EXIF、拍攝時間、GPS */
+    private fun writeMeta(from: File, to: File, w: Int, h: Int, t: java.time.ZonedDateTime, loc: Location?) {
         runCatching {
             val a = ExifInterface(from); val b = ExifInterface(to)
             for (tag in EXIF_TAGS) a.getAttribute(tag)?.let { b.setAttribute(tag, it) }
             b.setAttribute(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL.toString())
             b.setAttribute(ExifInterface.TAG_PIXEL_X_DIMENSION, w.toString()); b.setAttribute(ExifInterface.TAG_PIXEL_Y_DIMENSION, h.toString())
-            b.setAttribute(ExifInterface.TAG_SOFTWARE, "時間相機 1.2.0")
+            b.setAttribute(ExifInterface.TAG_SOFTWARE, "時間相機 1.3.0")
+            val dt = t.format(java.time.format.DateTimeFormatter.ofPattern("yyyy:MM:dd HH:mm:ss"))
+            val off = t.format(java.time.format.DateTimeFormatter.ofPattern("xxx"))
+            b.setAttribute(ExifInterface.TAG_DATETIME, dt); b.setAttribute(ExifInterface.TAG_DATETIME_ORIGINAL, dt); b.setAttribute(ExifInterface.TAG_DATETIME_DIGITIZED, dt)
+            b.setAttribute(ExifInterface.TAG_OFFSET_TIME, off); b.setAttribute(ExifInterface.TAG_OFFSET_TIME_ORIGINAL, off); b.setAttribute(ExifInterface.TAG_OFFSET_TIME_DIGITIZED, off)
+            if (loc != null) b.setGpsInfo(loc)
             b.saveAttributes()
         }
-    }
-
-    /** 拍攝時間（含 +08:00 時區）寫入 EXIF，避免相簿以 UTC 誤判而排到 8 小時前 */
-    private fun writeTime(f: File, t: java.time.ZonedDateTime) {
-        runCatching { ExifInterface(f).apply {
-            val dt = t.format(java.time.format.DateTimeFormatter.ofPattern("yyyy:MM:dd HH:mm:ss")); val off = t.format(java.time.format.DateTimeFormatter.ofPattern("xxx"))
-            setAttribute(ExifInterface.TAG_DATETIME, dt); setAttribute(ExifInterface.TAG_DATETIME_ORIGINAL, dt); setAttribute(ExifInterface.TAG_DATETIME_DIGITIZED, dt)
-            setAttribute(ExifInterface.TAG_OFFSET_TIME, off); setAttribute(ExifInterface.TAG_OFFSET_TIME_ORIGINAL, off); setAttribute(ExifInterface.TAG_OFFSET_TIME_DIGITIZED, off)
-            saveAttributes() } }
-    }
-
-    private fun writeGps(f: File, loc: Location?) {
-        if (loc == null) return
-        runCatching { ExifInterface(f).apply { setGpsInfo(loc); saveAttributes() } }
     }
 
 
@@ -445,7 +505,7 @@ class MainActivity : AppCompatActivity() {
     private val legacyDir get() = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM), "時間相機").apply { mkdirs() }
 
     /** 寫入相簿：完整中繼資料、IS_PENDING 生命週期、再掃描一次 */
-    private fun publishJpeg(tmp: File, name: String, takenMs: Long = System.currentTimeMillis()) {
+    private fun publishJpeg(tmp: File, name: String, takenMs: Long = System.currentTimeMillis(), refreshThumb: Boolean = true) {
         val bo = BitmapFactory.Options().apply { inJustDecodeBounds = true }; BitmapFactory.decodeFile(tmp.path, bo)
         val nowS = System.currentTimeMillis() / 1000
         if (Build.VERSION.SDK_INT >= 29) {
@@ -469,11 +529,11 @@ class MainActivity : AppCompatActivity() {
             } catch (e: Throwable) { runCatching { contentResolver.delete(uri, null, null) }; throw e }
             tmp.delete()
             rescan(uri, "image/jpeg")
-            rememberMedia(uri, "image/jpeg", name)
+            rememberMedia(uri, "image/jpeg", name, refreshThumb)
         } else {
             val f = File(legacyDir, name); tmp.copyTo(f, overwrite = true); tmp.delete()
             f.setLastModified(takenMs)
-            MediaScannerConnection.scanFile(this, arrayOf(f.path), arrayOf("image/jpeg")) { _, u -> if (u != null) rememberMedia(u, "image/jpeg", name) }
+            MediaScannerConnection.scanFile(this, arrayOf(f.path), arrayOf("image/jpeg")) { _, u -> if (u != null) rememberMedia(u, "image/jpeg", name, refreshThumb) }
         }
     }
 
@@ -695,12 +755,13 @@ class MainActivity : AppCompatActivity() {
         @Suppress("DEPRECATION") super.onBackPressed()
     }
 
-    private fun rememberMedia(uri: Uri, mime: String, name: String) {
+    private fun rememberMedia(uri: Uri, mime: String, name: String, refreshThumb: Boolean = true) {
         lastMediaUri = uri; lastMediaMime = mime
         WmData.prefs(this).edit().putString("lastUri", uri.toString()).putString("lastMime", mime).apply()
-        runOnUiThread {
-            bindThumb(uri)
-            lifecycleScope.launch {
+        if (refreshThumb) bindThumb(uri)
+        lifecycleScope.launch {
+            val up = UploadPrefs(this@MainActivity)
+            if (up.enabled) {
                 runCatching { UploadRepo(this@MainActivity).enqueue(uri, mime, name) }
                     .onFailure { android.util.Log.w("TimeCam", "queue upload: ${it.message}") }
                 UploadScheduler.afterCapture(this@MainActivity)
@@ -715,26 +776,57 @@ class MainActivity : AppCompatActivity() {
         bindThumb(lastMediaUri)
     }
 
-    private fun bindThumb(uri: Uri?) {
-        val iv = findViewById<ImageView>(R.id.lastThumb)
-        if (uri == null) { iv.setImageDrawable(null); return }
-        try {
-            if (lastMediaMime.startsWith("video")) {
-                val m = android.media.MediaMetadataRetriever()
-                runCatching {
-                    m.setDataSource(this, uri)
-                    iv.setImageBitmap(m.frameAtTime)
-                }
-                m.release()
-            } else {
-                val bo = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-                contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bo) }
-                val sample = ImageMath.sampleFor(bo.outWidth, bo.outHeight, 200_000)
-                val opts = BitmapFactory.Options().apply { inSampleSize = sample }
-                contentResolver.openInputStream(uri)?.use { iv.setImageBitmap(BitmapFactory.decodeStream(it, null, opts)) }
-            }
-        } catch (_: Exception) { }
+    private fun showThumbBitmap(bmp: Bitmap?) {
+        runOnUiThread {
+            val iv = findViewById<ImageView>(R.id.lastThumb)
+            if (bmp == null) iv.setImageDrawable(null) else iv.setImageBitmap(bmp)
+        }
     }
+
+    private fun showThumbFromBitmap(src: Bitmap) {
+        val (tw, th) = ImageMath.thumbSize(src.width, src.height)
+        val thumb = if (tw == src.width && th == src.height) src.copy(Bitmap.Config.ARGB_8888, false) else Bitmap.createScaledBitmap(src, tw, th, true)
+        thumbGen++
+        showThumbBitmap(thumb)
+    }
+
+    private fun showThumbFromFile(f: File) {
+        val bo = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(f.path, bo)
+        if (bo.outWidth <= 0 || bo.outHeight <= 0) return
+        val sample = ImageMath.sampleFor(bo.outWidth, bo.outHeight, ImageMath.THUMB_PIXELS)
+        val bmp = BitmapFactory.decodeFile(f.path, BitmapFactory.Options().apply { inSampleSize = sample }) ?: return
+        thumbGen++
+        showThumbBitmap(bmp)
+    }
+
+    private fun bindThumb(uri: Uri?) {
+        val gen = ++thumbGen
+        if (uri == null) { showThumbBitmap(null); return }
+        val mime = lastMediaMime
+        bg.execute {
+            val bmp = decodeThumb(uri, mime)
+            if (gen == thumbGen) showThumbBitmap(bmp)
+        }
+    }
+
+    private fun decodeThumb(uri: Uri, mime: String): Bitmap? = try {
+        if (mime.startsWith("video")) {
+            val m = android.media.MediaMetadataRetriever()
+            val frame = runCatching {
+                m.setDataSource(this, uri)
+                m.frameAtTime
+            }.getOrNull()
+            m.release()
+            frame
+        } else {
+            val bo = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bo) }
+            val sample = ImageMath.sampleFor(bo.outWidth, bo.outHeight, ImageMath.THUMB_PIXELS)
+            val opts = BitmapFactory.Options().apply { inSampleSize = sample }
+            contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, opts) }
+        }
+    } catch (_: Exception) { null }
 
     private fun openLastPhoto() {
         val uri = lastMediaUri ?: WmData.prefs(this).getString("lastUri", null)?.let { Uri.parse(it) }
@@ -797,5 +889,5 @@ class MainActivity : AppCompatActivity() {
         dlg.show()
     }
 
-    override fun onDestroy() { recording?.stop(); effectThread.quitSafely(); bg.shutdown(); super.onDestroy() }
+    override fun onDestroy() { recording?.stop(); effectThread.quitSafely(); shutterSound?.release(); shutterSound = null; bg.shutdown(); super.onDestroy() }
 }

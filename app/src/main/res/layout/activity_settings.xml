@@ -14,8 +14,19 @@
         </LinearLayout>
     </LinearLayout>
     <ScrollView android:layout_width="match_parent" android:layout_height="0dp" android:layout_weight="1">
-        <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+        <LinearLayout android:id="@+id/settingsBody" android:layout_width="match_parent" android:layout_height="wrap_content"
             android:orientation="vertical" android:padding="16dp" android:paddingBottom="32dp">
+            <LinearLayout style="@style/SettingsCard">
+                <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+                    android:gravity="center_vertical" android:padding="16dp">
+                    <LinearLayout android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:orientation="vertical">
+                        <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="快門聲音" android:textStyle="bold" android:textSize="15sp" android:textColor="#111"/>
+                        <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="拍照時發出快門聲；手機在靜音或震動模式時不會出聲" android:textSize="12sp" android:textColor="#8B8B8B" android:layout_marginTop="2dp"/>
+                    </LinearLayout>
+                    <androidx.appcompat.widget.SwitchCompat android:id="@+id/swShutterSound" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+                </LinearLayout>
+            </LinearLayout>
+
             <TextView android:layout_width="match_parent" android:layout_height="wrap_content"
                 android:text="相機會把原檔上傳到你指定的一個雲端硬碟資料夾，不會在 App 裡分類。開啟後仍會先存進手機相簿。"
                 android:textSize="12sp" android:textColor="#888888" android:lineSpacingMultiplier="1.4" android:padding="4dp" android:paddingBottom="12dp"/>
@@ -96,7 +107,7 @@
             </LinearLayout>
 
             <TextView android:layout_width="match_parent" android:layout_height="wrap_content"
-                android:gravity="center" android:paddingTop="12dp" android:text="時間相機 1.2.0" android:textSize="11sp" android:textColor="#AAAAAA"/>
+                android:gravity="center" android:paddingTop="12dp" android:text="時間相機 1.3.0" android:textSize="11sp" android:textColor="#AAAAAA"/>
         </LinearLayout>
     </ScrollView>
 </LinearLayout>

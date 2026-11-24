@@ -8,7 +8,7 @@ val ksProps = Properties().apply { val f = rootProject.file("keystore/keystore.p
 android {
     namespace = "tw.timecam"
     compileSdk = 35
-    defaultConfig { applicationId = "tw.timecam"; minSdk = 26; targetSdk = 35; versionCode = 9; versionName = "1.2.0" }
+    defaultConfig { applicationId = "tw.timecam"; minSdk = 26; targetSdk = 35; versionCode = 10; versionName = "1.3.0" }
     signingConfigs {
         if (ksProps.isNotEmpty()) create("release") {
             storeFile = rootProject.file("keystore/" + ksProps["storeFile"]); storePassword = ksProps["storePassword"] as String

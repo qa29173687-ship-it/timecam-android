@@ -43,15 +43,16 @@ class SettingsActivity : AppCompatActivity() {
         setContentView(R.layout.activity_settings)
         prefs = UploadPrefs(this)
         EdgeInsets.pad(findViewById(R.id.settingsTop), bottom = false)
-        findViewById<View>(R.id.settingsRoot).let { root ->
-            // bottom inset on the scroll content via root padding is handled by top only; add bottom pad on root's last child area
-        }
+        EdgeInsets.pad(findViewById(R.id.settingsBody), left = false, top = false, right = false, bottom = true, ime = true)
         findViewById<View>(R.id.btnBack).setOnClickListener { finish() }
         bind()
         refresh()
     }
 
     private fun bind() {
+        findViewById<SwitchCompat>(R.id.swShutterSound).setOnCheckedChangeListener { _, on ->
+            WmData.prefs(this).edit().putBoolean("shutterSound", on).apply()
+        }
         findViewById<SwitchCompat>(R.id.swUpload).setOnCheckedChangeListener { _, on ->
             if (on && !prefs.granted) {
                 findViewById<SwitchCompat>(R.id.swUpload).isChecked = false
@@ -134,6 +135,7 @@ class SettingsActivity : AppCompatActivity() {
     }
 
     private fun refresh() {
+        findViewById<SwitchCompat>(R.id.swShutterSound).isChecked = WmData.prefs(this).getBoolean("shutterSound", true)
         findViewById<SwitchCompat>(R.id.swUpload).isChecked = prefs.enabled
         findViewById<RadioButton>(if (prefs.whenMode == "daily") R.id.whenDaily else R.id.whenImmediate).isChecked = true
         findViewById<SwitchCompat>(R.id.swWifi).isChecked = prefs.wifiOnly

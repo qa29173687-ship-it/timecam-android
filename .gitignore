@@ -8,3 +8,4 @@ keystore/
 keystore.properties
 .idea/
 TimeCam-*.apk
+google-services.json
