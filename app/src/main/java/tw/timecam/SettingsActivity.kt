@@ -12,6 +12,7 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.SwitchCompat
 import androidx.core.view.WindowCompat
@@ -53,6 +54,7 @@ class SettingsActivity : AppCompatActivity() {
         findViewById<SwitchCompat>(R.id.swShutterSound).setOnCheckedChangeListener { _, on ->
             WmData.prefs(this).edit().putBoolean("shutterSound", on).apply()
         }
+        findViewById<View>(R.id.rowPhotoRes).setOnClickListener { pickPhotoRes() }
         findViewById<SwitchCompat>(R.id.swUpload).setOnCheckedChangeListener { _, on ->
             if (on && !prefs.granted) {
                 findViewById<SwitchCompat>(R.id.swUpload).isChecked = false
@@ -136,6 +138,7 @@ class SettingsActivity : AppCompatActivity() {
 
     private fun refresh() {
         findViewById<SwitchCompat>(R.id.swShutterSound).isChecked = WmData.prefs(this).getBoolean("shutterSound", true)
+        refreshPhotoRes()
         findViewById<SwitchCompat>(R.id.swUpload).isChecked = prefs.enabled
         findViewById<RadioButton>(if (prefs.whenMode == "daily") R.id.whenDaily else R.id.whenImmediate).isChecked = true
         findViewById<SwitchCompat>(R.id.swWifi).isChecked = prefs.wifiOnly
@@ -166,6 +169,29 @@ class SettingsActivity : AppCompatActivity() {
         findViewById<View>(R.id.timeRow).alpha = if (prefs.whenMode == "daily") 1f else 0.4f
         findViewById<View>(R.id.btnTime).isEnabled = prefs.whenMode == "daily"
         findViewById<TextView>(R.id.btnTime).text = prefs.time
+    }
+
+    private fun photoChoices() = StillSizes.choices(this)
+
+    private fun refreshPhotoRes(choices: List<StillChoice> = photoChoices()) {
+        val cur = StillSizes.resolve(StillSizes.pref(this), choices)
+        findViewById<TextView>(R.id.photoResValue).text = StillSizes.summary(cur)
+    }
+
+    private fun pickPhotoRes() {
+        val choices = photoChoices()
+        val cur = StillSizes.resolve(StillSizes.pref(this), choices)
+        val labels = choices.map { StillSizes.summary(it) }.toTypedArray()
+        val idx = choices.indexOfFirst { it.id == cur.id }.coerceAtLeast(0)
+        AlertDialog.Builder(this)
+            .setTitle("照片畫素")
+            .setSingleChoiceItems(labels, idx) { dlg, i ->
+                StillSizes.save(this, choices[i].id)
+                refreshPhotoRes(choices)
+                dlg.dismiss()
+            }
+            .setNegativeButton("取消", null)
+            .show()
     }
 
     private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()

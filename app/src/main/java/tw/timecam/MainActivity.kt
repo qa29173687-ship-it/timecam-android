@@ -55,6 +55,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var shutter: ShutterView
     private val bg = Executors.newSingleThreadExecutor()
     private val capturing = AtomicBoolean(false)
+    private var boundPhotoRes: String? = null
     private var shutterSound: MediaActionSound? = null
     private var thumbGen = 0
     private var provider: ProcessCameraProvider? = null
@@ -186,9 +187,7 @@ class MainActivity : AppCompatActivity() {
         val prevSize = if (videoMode) Size(1920, 1080) else Size(1920, 1440)
         val prs = ResolutionSelector.Builder().setAspectRatioStrategy(ratio)
             .setResolutionStrategy(ResolutionStrategy(prevSize, ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER)).build()
-        val stillSize = Size(ImageMath.MAX_STILL_LONG_EDGE, ImageMath.MAX_STILL_LONG_EDGE * 3 / 4) // 4000x3000 ≈ 12MP
-        val rs = ResolutionSelector.Builder().setAspectRatioStrategy(ratio)
-            .setResolutionStrategy(ResolutionStrategy(stillSize, ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER)).build()
+        val rs = stillSelector(ratio)
         val preview = Preview.Builder().setResolutionSelector(prs).build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
         try {
             if (!videoMode) {
@@ -329,6 +328,17 @@ class MainActivity : AppCompatActivity() {
         findViewById<TextView>(R.id.dExt).text = "影像模式　　" + extName(extMode)
     }
 
+    private fun stillChoices(): List<StillChoice> =
+        StillSizes.choices(this, if (lensFacing == CameraSelector.LENS_FACING_FRONT) android.hardware.camera2.CameraCharacteristics.LENS_FACING_FRONT else android.hardware.camera2.CameraCharacteristics.LENS_FACING_BACK, camera?.cameraInfo)
+
+    private fun stillSelector(ratio: AspectRatioStrategy): ResolutionSelector {
+        val choice = StillSizes.resolve(StillSizes.pref(this), stillChoices())
+        boundPhotoRes = choice.id
+        val strategy = if (choice.isMax || choice.width <= 0) ResolutionStrategy.HIGHEST_AVAILABLE_STRATEGY
+        else ResolutionStrategy(android.util.Size(choice.width, choice.height), ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER)
+        return ResolutionSelector.Builder().setAspectRatioStrategy(ratio).setResolutionStrategy(strategy).build()
+    }
+
     // ---------- 照片 ----------
     private fun shutterSoundOn() = WmData.prefs(this).getBoolean("shutterSound", true)
 
@@ -416,8 +426,11 @@ class MainActivity : AppCompatActivity() {
         val bo = BitmapFactory.Options().apply { inJustDecodeBounds = true }; BitmapFactory.decodeFile(src.path, bo)
         if (bo.outWidth <= 0 || bo.outHeight <= 0) error("無法讀取影像")
         val memPx = Runtime.getRuntime().maxMemory() / 4 / 3
-        // 解碼時接近 12MP（必要時留一檔給 capSize 精準縮小），並受記憶體限制
-        var sample = ImageMath.sampleForDecode(bo.outWidth, bo.outHeight, ImageMath.MAX_STILL_PIXELS, memPx)
+        val choice = StillSizes.resolve(StillSizes.pref(this), stillChoices())
+        val capPx = StillSizes.capPixels(choice)
+        val capLong = StillSizes.capLongEdge(choice)
+        // 依使用者選的畫素解碼（最高則盡量原尺寸），並受記憶體限制
+        var sample = ImageMath.sampleForDecode(bo.outWidth, bo.outHeight, if (choice.isMax) memPx else capPx, memPx)
         var decoded: Bitmap? = null
         while (decoded == null) {
             var bmp: Bitmap? = null
@@ -431,8 +444,8 @@ class MainActivity : AppCompatActivity() {
             } finally { if (bmp != null && bmp !== decoded) bmp.recycle() }
         }
         var out: Bitmap = decoded
-        if (ImageMath.needsCap(out.width, out.height)) {
-            val (nw, nh) = ImageMath.capSize(out.width, out.height)
+        if (ImageMath.needsCap(out.width, out.height, capLong, capPx)) {
+            val (nw, nh) = ImageMath.capSize(out.width, out.height, capLong, capPx)
             val scaled = Bitmap.createScaledBitmap(out, nw, nh, true)
             if (scaled !== out) out.recycle()
             out = if (scaled.isMutable) scaled else {
@@ -482,7 +495,7 @@ class MainActivity : AppCompatActivity() {
             for (tag in EXIF_TAGS) a.getAttribute(tag)?.let { b.setAttribute(tag, it) }
             b.setAttribute(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL.toString())
             b.setAttribute(ExifInterface.TAG_PIXEL_X_DIMENSION, w.toString()); b.setAttribute(ExifInterface.TAG_PIXEL_Y_DIMENSION, h.toString())
-            b.setAttribute(ExifInterface.TAG_SOFTWARE, "時間相機 1.3.0")
+            b.setAttribute(ExifInterface.TAG_SOFTWARE, "時間相機 1.3.1")
             val dt = t.format(java.time.format.DateTimeFormatter.ofPattern("yyyy:MM:dd HH:mm:ss"))
             val off = t.format(java.time.format.DateTimeFormatter.ofPattern("xxx"))
             b.setAttribute(ExifInterface.TAG_DATETIME, dt); b.setAttribute(ExifInterface.TAG_DATETIME_ORIGINAL, dt); b.setAttribute(ExifInterface.TAG_DATETIME_DIGITIZED, dt)
@@ -702,7 +715,13 @@ class MainActivity : AppCompatActivity() {
         tv.text = if (l == null) Geo.status else "自動：" + Geo.addr.ifBlank { Geo.addrStatus.ifBlank { "地址查詢中…" } } + "\n" + Geo.coords(l)
     }
 
-    override fun onResume() { super.onResume(); if (hasLoc()) startLocation(); loadLastThumb() }
+    override fun onResume() {
+        super.onResume(); if (hasLoc()) startLocation(); loadLastThumb()
+        if (!videoMode && provider != null) {
+            val id = StillSizes.resolve(StillSizes.pref(this), stillChoices()).id
+            if (id != boundPhotoRes) bind()
+        }
+    }
     override fun onPause() { lm?.removeUpdates(locListener); super.onPause() }
 
 
